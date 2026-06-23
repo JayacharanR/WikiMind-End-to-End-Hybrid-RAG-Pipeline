@@ -1,0 +1,11 @@
+langchain
+langgraph
+fastapi
+qdrant-client
+rank_bm25
+langfuse
+nemoguardrails
+tavily-python
+uvicorn
+redisvl
+redis
