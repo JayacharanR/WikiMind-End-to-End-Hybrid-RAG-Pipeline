@@ -25,4 +25,4 @@ WikiMind is a Tri-Modal Retrieval-Augmented Generation (RAG) pipeline designed t
 This project is licensed under the [MIT License](LICENSE).
 
 ## Author
-**Jayacharan R**
+**[Jayacharan R](https://github.com/JayacharanR)**
