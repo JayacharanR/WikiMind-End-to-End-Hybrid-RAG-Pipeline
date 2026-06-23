@@ -1,41 +1,26 @@
 # WikiMind: Hybrid Agentic RAG Pipeline
 
-WikiMind is a state-of-the-art **Tri-Modal Retrieval-Augmented Generation (RAG)** pipeline designed to ingest, process, and accurately synthesize answers from the Wikipedia dataset. Built with production-grade 2025/2026 architectural patterns, it goes beyond naive vector search by implementing a self-healing LangGraph workflow.
+WikiMind is a Tri-Modal Retrieval-Augmented Generation (RAG) pipeline designed to ingest, process, and accurately synthesize answers from the Wikipedia dataset. It is structured as a microservices architecture to ensure high availability and robust performance.
 
-## 🚀 Key Features
+## Key Features
 
-*   **Tri-Modal Retrieval Architecture**:
-    *   *Dense Search*: Semantic matching using `fastembed` (BGE models) and Qdrant.
-    *   *Sparse Search*: Exact keyword matching using BM25.
-    *   *Vectorless / PageIndex*: Tree-based hierarchical document navigation to prevent context fragmentation.
-*   **Agentic Self-Healing**: Utilizing **LangGraph** for a Corrective RAG (CRAG) loop. If retrieved documents are irrelevant, the agent automatically rewrites the query and searches again.
-*   **Query Expansion**: Optional HyDE/Multi-Query expansion to maximize recall.
-*   **Observability & Guardrails**: Integrated with Langfuse for distributed tracing and LLM safety filters.
+*   **Tri-Modal Retrieval Architecture**: Incorporates Dense Search (Semantic), Sparse Search (BM25), and Vectorless Tree Navigation (PageIndex).
+*   **Semantic Caching**: Utilizes RedisVL to intercept queries and return cached responses at low latency, bypassing expensive LLM computation.
+*   **Agentic Orchestration**: Deploys LangGraph for a Corrective RAG (CRAG) loop with web search fallbacks via Tavily.
+*   **Continuous Synchronization**: Listens to Wikimedia EventStreams API to continuously synchronize the Qdrant vector database with live Wikipedia edits.
+*   **Observability and Guardrails**: Monitored strictly via Langfuse, with interaction safety enforced by NeMo Guardrails.
 
----
+## Tech Stack
 
-## 🏗️ Project Progress
+*   **Backend**: Python, FastAPI, LangGraph, NeMo Guardrails
+*   **Frontend**: Streamlit
+*   **Data Pipeline**: aiohttp, LangChain, text-embedding-3-small
+*   **Databases**: Qdrant (Vector & Sparse Storage), Redis (Semantic Caching via RedisVL), MongoDB/Local (Document Storage)
+*   **Observability**: Langfuse
+*   **Deployment**: Docker Compose
 
-### ✅ Phase 1: Foundation & Data Pipeline
-- Set up Python environment with `uv` and configured dependencies.
-- Created scalable `wikipedia_stream.py` to ingest Hugging Face Wikipedia datasets via streaming (avoiding massive local downloads).
-- Implemented intelligent semantic chunking using `MarkdownHeaderTextSplitter`.
-- Initialized local **Qdrant** vector database and integrated `fastembed` for blazing-fast local embeddings.
-
-### ⏳ Phase 2: Tri-Modal Retrieval Engine (Up Next)
-- Implement Dense Embeddings (Vector Search).
-- Implement Sparse Search (BM25).
-- Build Vectorless/PageIndex tree structure processing.
-- Implement Fusion (RRF) and Cross-Encoder Re-ranking.
-
-### ⏳ Phase 3: Agentic Flow & Self-Healing
-### ⏳ Phase 4: Observability & Guardrails
-### ⏳ Phase 5: Cloud Deployment
+## Documentation Requirements
+Per project guidelines, all documentation, code, and commit messages must maintain a strict professional and technical tone.
 
 ---
-
-## 🛠️ Tech Stack
-- **Data & Embedding**: Hugging Face Datasets, LangChain, FastEmbed
-- **Vector Database**: Qdrant (Local & Cloud)
-- **Agent Framework**: LangGraph
-- **Observability**: Langfuse
+*Note: The project architecture has recently been revised to support containerized microservices. The codebase is currently undergoing transition.*
