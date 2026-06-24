@@ -1,0 +1,17 @@
+define bot inform hallucination detected
+    "I apologize, but I was unable to generate a response that is fully grounded in the retrieved Wikipedia sources. Please try rephrasing your question or ask about a different topic."
+
+define flow check hallucination
+    $is_hallucinated = execute check_hallucination
+    if $is_hallucinated
+        bot inform hallucination detected
+        stop
+
+define bot inform unsafe content detected
+    "I'm sorry, the generated response was flagged by our content safety filters. I cannot provide this response."
+
+define flow check output safety
+    $is_unsafe = execute check_output_safety
+    if $is_unsafe
+        bot inform unsafe content detected
+        stop

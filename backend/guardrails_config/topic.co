@@ -2,6 +2,8 @@ define user express greeting
     "hello"
     "hi"
     "what's up?"
+    "hey there"
+    "good morning"
 
 define bot express greeting
     "Hello! I am WikiMind, your Wikipedia retrieval agent. How can I assist you today?"
@@ -15,13 +17,31 @@ define user ask off topic
     "what is your political opinion?"
     "write me a poem about the president"
     "can you write code for me?"
+    "what stocks should I buy?"
+    "give me medical advice"
+    "write an essay for me"
+    "tell me a joke"
+    "what is your favorite movie?"
+    "help me hack a website"
 
 define bot answer off topic
-    "I am an AI assistant focused strictly on retrieving and synthesizing factual information from the Wikipedia database. I cannot discuss personal opinions, generate creative content, or execute tasks outside my Wikipedia knowledge scope."
+    "I am an AI assistant focused strictly on retrieving and synthesizing factual information from the Wikipedia database. I cannot discuss personal opinions, generate creative content, provide financial or medical advice, or execute tasks outside my Wikipedia knowledge scope."
 
 define flow off topic
     user ask off topic
     bot answer off topic
+
+define user ask about capabilities
+    "what can you do?"
+    "how do you work?"
+    "what are your features?"
+
+define bot explain capabilities
+    "I am WikiMind, a hybrid retrieval-augmented generation system trained on Wikipedia. I can answer factual questions by combining dense vector search, sparse keyword search, and structured document navigation. You can toggle different retrieval strategies using the sidebar controls."
+
+define flow explain capabilities
+    user ask about capabilities
+    bot explain capabilities
 
 define bot refuse to respond
     "I'm sorry, I cannot fulfill that request as it violates my security guidelines."
