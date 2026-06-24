@@ -8,12 +8,33 @@ wheels/
 
 # Virtual environments
 .venv
+
+# Agent and task files
 .agents/
-
-#environment variables
-.env
-
-#todo
 todo.md
 implementation_plan.md
 task.md
+
+# Environment variables
+.env
+
+# Docker volumes and runtime data
+local_qdrant/
+data/
+qdrant_storage/
+redis_data/
+grafana_data/
+prometheus_data/
+
+# Data pipeline artifacts
+*.parquet
+*.arrow
+checkpoints/
+
+# OS and editor files
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
