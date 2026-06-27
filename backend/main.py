@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from backend.cache import cache_lookup, close_redis, get_redis_client
+from backend.cache import cache_lookup, cache_store, close_redis, get_redis_client
 from backend.config import get_settings
 from backend.llmops import get_langfuse_client, init_observability
 from backend.models import ChatRequest, ChatResponse, HealthResponse, RetrievalMetadata, ServiceStatus
@@ -153,16 +153,18 @@ async def health_check():
     return HealthResponse(status=overall, components=components)
 
 
+import json
+import asyncio
+from sse_starlette.sse import EventSourceResponse
+
 @app.post("/chat")
 async def chat_endpoint(request: ChatRequest):
     """Primary RAG chat endpoint with cache-first routing.
 
     Checks the dual-layer cache (L1 exact-match, then L2 semantic) before
-    invoking the LangGraph agent pipeline. Cache hits are returned immediately
-    with appropriate metadata.
-
-    In the full implementation, cache misses will invoke the LangGraph
-    CRAG/Self-RAG state machine and stream the response via SSE.
+    invoking the LangGraph agent pipeline. Cache hits are returned immediately.
+    Cache misses invoke the CRAG/Self-RAG state machine and stream the response
+    via SSE.
     """
     query = request.query
 
@@ -181,18 +183,96 @@ async def chat_endpoint(request: ChatRequest):
             },
         })
 
-    # Cache miss: placeholder for LangGraph agent invocation
-    # TODO: Invoke the LangGraph CRAG/Self-RAG pipeline here
-    logger.info("Cache miss. Agent pipeline invocation pending for: %s", query[:60])
-
-    return JSONResponse(content={
-        "answer": "WikiMind agent pipeline not yet connected. Cache miss for your query.",
-        "sources": [],
-        "metadata": {
-            "cache_hit": False,
-            "strategies_used": list(
-                k for k, v in request.strategies.model_dump().items() if v
-            ),
-            "agent_steps": 0,
-        },
-    })
+    # Cache miss: Stream from LangGraph
+    async def sse_generator():
+        from backend.agent import agent_app, AgentState
+        from backend.llmops import get_langfuse_handler
+        
+        initial_state: AgentState = {
+            "query": query,
+            "expanded_queries": [],
+            "documents": [],
+            "generation": "",
+            "web_results": [],
+            "retrieval_grade": "",
+            "hallucination_grade": "",
+            "answer_grade": "",
+            "steps": 0,
+            "active_strategies": request.strategies,
+            "retry_count": 0,
+        }
+        
+        # Setup Langfuse callbacks
+        config = {}
+        handler = get_langfuse_handler()
+        if handler:
+            config = {"callbacks": [handler]}
+            
+        logger.info("Invoking LangGraph agent pipeline for: %s", query[:60])
+        
+        try:
+            # Stream the state updates from LangGraph
+            async for output in agent_app.astream(initial_state, config=config, stream_mode="updates"):
+                # output is a dict keyed by the node name
+                for node_name, state_update in output.items():
+                    event_data = {
+                        "node": node_name,
+                        "steps": state_update.get("steps", 0),
+                        "status": f"Completed node: {node_name}"
+                    }
+                    
+                    if node_name == "retrieve":
+                        docs = state_update.get("documents", [])
+                        event_data["document_count"] = len(docs)
+                        
+                    yield {
+                        "event": "update",
+                        "data": json.dumps(event_data)
+                    }
+                    
+                    # Store final state to yield at the end
+                    final_state_update = state_update
+                    
+            # Once graph completes, yield the final answer and cache it
+            if 'generation' in final_state_update:
+                answer = final_state_update['generation']
+                sources = final_state_update.get('documents', [])
+                
+                # Format sources for response
+                formatted_sources = [
+                    {
+                        "title": d.get("title", ""),
+                        "content": d.get("content", ""),
+                        "score": d.get("score", 0.0),
+                        "url": d.get("url")
+                    } for d in sources
+                ]
+                
+                final_response = {
+                    "answer": answer,
+                    "sources": formatted_sources,
+                    "metadata": {
+                        "cache_hit": False,
+                        "strategies_used": list(
+                            k for k, v in request.strategies.model_dump().items() if v
+                        ),
+                        "agent_steps": final_state_update.get("steps", 0),
+                    }
+                }
+                
+                # Write to semantic cache
+                asyncio.create_task(cache_store(query, final_response))
+                
+                yield {
+                    "event": "final",
+                    "data": json.dumps(final_response)
+                }
+                
+        except Exception as exc:
+            logger.error("Error during LangGraph streaming: %s", exc)
+            yield {
+                "event": "error",
+                "data": json.dumps({"detail": str(exc)})
+            }
+            
+    return EventSourceResponse(sse_generator())
