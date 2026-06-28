@@ -79,6 +79,42 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
     return stale_titles
 
 
+from langfuse.decorators import observe, langfuse_context
+
+@observe(name="state_reconciliation_run")
+async def run_reconciliation_cycle():
+    langfuse_context.update_current_trace(
+        metadata={"sample_size": SAMPLE_SIZE}
+    )
+    logger.info("Beginning reconciliation cycle...")
+    try:
+        titles = await get_random_titles_from_qdrant(limit=SAMPLE_SIZE)
+        if not titles:
+            logger.info("Qdrant collection empty. Sleeping...")
+            return
+            
+        logger.info("Sampled %d unique articles for reconciliation.", len(titles))
+        
+        headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
+        async with aiohttp.ClientSession(headers=headers) as session:
+            stale_titles = await check_live_revisions(session, titles)
+            
+            if stale_titles:
+                logger.warning("Detected drift in %d articles. Re-ingesting...", len(stale_titles))
+                for title in stale_titles:
+                    fake_event = {"title": title, "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"}}
+                    await process_event(fake_event, session)
+            else:
+                logger.info("No drift detected in sample.")
+                
+            langfuse_context.update_current_trace(
+                output={"stale_count": len(stale_titles), "sample_count": len(titles)}
+            )
+    except Exception as exc:
+        logger.error("Reconciliation cycle failed: %s", exc)
+        langfuse_context.update_current_trace(level="ERROR", status_message=str(exc))
+
+
 async def reconcile_loop():
     """Main reconciliation loop."""
     settings = get_settings()
@@ -89,47 +125,11 @@ async def reconcile_loop():
     
     while True:
         start_time = time.time()
-        langfuse = get_langfuse_client()
         
-        trace = None
-        if langfuse:
-            trace = langfuse.trace(
-                name="state_reconciliation_run",
-                metadata={"sample_size": SAMPLE_SIZE}
-            )
-            
-        logger.info("Beginning reconciliation cycle...")
-        
-        try:
-            titles = await get_random_titles_from_qdrant(limit=SAMPLE_SIZE)
-            if not titles:
-                logger.info("Qdrant collection empty. Sleeping...")
-            else:
-                logger.info("Sampled %d unique articles for reconciliation.", len(titles))
-                
-                async with aiohttp.ClientSession() as session:
-                    stale_titles = await check_live_revisions(session, titles)
-                    
-                    if stale_titles:
-                        logger.warning("Detected drift in %d articles. Re-ingesting...", len(stale_titles))
-                        for title in stale_titles:
-                            # We can reuse the wiki_updater logic by faking an event
-                            fake_event = {"title": title, "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"}}
-                            await process_event(fake_event, session)
-                    else:
-                        logger.info("No drift detected in sample.")
-                        
-                if trace:
-                    trace.update(
-                        output={"stale_count": len(stale_titles), "sample_count": len(titles)}
-                    )
-                    
-        except Exception as exc:
-            logger.error("Reconciliation cycle failed: %s", exc)
-            if trace:
-                trace.update(level="ERROR", status_message=str(exc))
+        await run_reconciliation_cycle()
                 
         # Flush traces
+        langfuse = get_langfuse_client()
         if langfuse:
             langfuse.flush()
             

@@ -11,20 +11,18 @@ WORKDIR /app
 
 # Install system dependencies
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends gcc curl \
+    && apt-get install -y --no-install-recommends gcc g++ curl \
     && rm -rf /var/lib/apt/lists/*
 
 # ---- Builder Stage ----
 FROM base AS builder
 
-# Install poetry
-RUN pip install poetry==1.8.2
-ENV POETRY_NO_INTERACTION=1 \
-    POETRY_VIRTUALENVS_IN_PROJECT=1 \
-    POETRY_VIRTUALENVS_CREATE=1
+# Install uv
+RUN pip install uv
+ENV UV_PROJECT_ENVIRONMENT=/app/.venv
 
-COPY pyproject.toml poetry.lock ./
-RUN poetry install --no-root --only main
+COPY pyproject.toml uv.lock ./
+RUN uv sync --no-dev --frozen --no-install-project
 
 # ---- Production Stage ----
 FROM base AS production

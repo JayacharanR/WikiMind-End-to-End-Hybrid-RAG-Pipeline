@@ -5,7 +5,7 @@ and Reciprocal Rank Fusion (RRF) via the Qdrant Universal Query API.
 """
 
 import logging
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
 from qdrant_client.http import models
 

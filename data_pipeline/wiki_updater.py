@@ -138,7 +138,8 @@ async def listen_to_stream():
     while True:
         try:
             logger.info("Connecting to Wikimedia EventStreams...")
-            async with aiohttp.ClientSession() as session:
+            headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
+            async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(stream_url, headers={"Accept": "text/event-stream"}) as response:
                     if response.status != 200:
                         logger.error("Failed to connect: HTTP %d", response.status)
