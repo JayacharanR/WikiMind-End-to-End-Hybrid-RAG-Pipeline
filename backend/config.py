@@ -27,7 +27,7 @@ class Settings(BaseSettings):
 
     # --- OpenRouter -------------------------------------------------------
     openrouter_api_key: str = ""
-    openrouter_model: str = "meta-llama/llama-3.1-8b-instruct:free"
+    openrouter_model: str = "gpt-oss-20b:free"
 
     # --- Embedding Model --------------------------------------------------
     # Dense embedding model used for semantic vector generation.

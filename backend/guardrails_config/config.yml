@@ -4,13 +4,6 @@ models:
     model: gpt-4o-mini
 
 rails:
-  input:
-    flows:
-      - check jailbreak
-  output:
-    flows:
-      - check hallucination
-      - check output safety
   dialog:
     single_call:
       enabled: True
