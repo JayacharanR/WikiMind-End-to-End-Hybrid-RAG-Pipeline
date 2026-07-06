@@ -1,9 +1,10 @@
-"""WikiMind Streamlit Frontend.
+"""WikiMind Streamlit Frontend (Multi-Page).
 
-Provides an interactive chat interface for the Tri-Brid Agentic RAG pipeline.
-Includes sidebar toggles for configuring query expansion and retrieval strategies,
-displays real-time SSE streaming from the FastAPI backend, and renders retrieved
-sources and execution metadata in expandable sections.
+Provides an interactive chat interface for the Two-Stage Agentic RAG pipeline
+as the default page, with additional pages for A/B strategy comparison and
+evaluation results browsing. Includes sidebar toggles for configuring query
+expansion and retrieval strategies, displays real-time SSE streaming from the
+FastAPI backend, and renders retrieved sources and execution metadata.
 """
 
 import json
@@ -118,7 +119,7 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                 data = json.loads(event.data)
                 node = data.get("node")
                 status = data.get("status")
-                status_placeholder.info(f"🔄 Agent working: {status} ({node})")
+                status_placeholder.info(f"Agent working: {status} ({node})")
                 
             elif event.event == "final":
                 data = json.loads(event.data)
@@ -133,7 +134,7 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                 # Render sources
                 sources = data.get("sources", [])
                 if sources:
-                    with sources_placeholder.expander(f"📚 View {len(sources)} Retrieved Sources"):
+                    with sources_placeholder.expander(f"View {len(sources)} Retrieved Sources"):
                         for i, source in enumerate(sources):
                             st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
                             st.markdown(f"> {source.get('content')[:300]}...")
@@ -143,7 +144,7 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                             
                 # Render metadata
                 metadata = data.get("metadata", {})
-                with st.expander("🛠️ Execution Metadata"):
+                with st.expander("Execution Metadata"):
                     st.json(metadata)
                     
                 # Save to session state
@@ -159,13 +160,8 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
         st.error(f"Failed to connect to backend: {exc}")
 
 
-def main():
-    st.set_page_config(
-        page_title="WikiMind | Tri-Brid Hybrid RAG",
-        page_icon="🧠",
-        layout="wide",
-    )
-    
+def chat_page():
+    """Render the main chat interface page."""
     st.title("WikiMind RAG Pipeline")
     st.markdown("Ask complex questions. The agent uses Two-Stage Hybrid RAG: a local article index identifies Wikipedia articles, then Qdrant hybrid search extracts precise answers.")
     
@@ -182,7 +178,7 @@ def main():
             st.markdown(message["content"])
             if message["role"] == "assistant":
                 if message.get("sources"):
-                    with st.expander(f"📚 View {len(message['sources'])} Retrieved Sources"):
+                    with st.expander(f"View {len(message['sources'])} Retrieved Sources"):
                         for i, source in enumerate(message['sources']):
                             st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
                             st.markdown(f"> {source.get('content')[:300]}...")
@@ -190,7 +186,7 @@ def main():
                                 st.markdown(f"[Read on Wikipedia]({source.get('url')})")
                             st.divider()
                 if message.get("metadata"):
-                    with st.expander("🛠️ Execution Metadata"):
+                    with st.expander("Execution Metadata"):
                         st.json(message["metadata"])
                         
     # Chat input
@@ -207,5 +203,27 @@ def main():
             stream_chat_response(query, strategies)
 
 
+def main():
+    """Multi-page Streamlit application entry point."""
+    st.set_page_config(
+        page_title="WikiMind | Hybrid RAG Pipeline",
+        page_icon="W",
+        layout="wide",
+    )
+
+    from frontend.pages.ab_dashboard import render_ab_dashboard
+    from frontend.pages.eval_results import render_eval_results
+
+    pages = {
+        "Chat": st.Page(chat_page, title="Chat", icon=":material/chat:"),
+        "A/B Dashboard": st.Page(render_ab_dashboard, title="A/B Dashboard", icon=":material/compare_arrows:"),
+        "Eval Results": st.Page(render_eval_results, title="Eval Results", icon=":material/analytics:"),
+    }
+
+    nav = st.navigation(pages)
+    nav.run()
+
+
 if __name__ == "__main__":
     main()
+

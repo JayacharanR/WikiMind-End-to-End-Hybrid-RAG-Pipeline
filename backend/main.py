@@ -283,3 +283,85 @@ async def chat_endpoint(request: ChatRequest):
             }
             
     return EventSourceResponse(sse_generator())
+
+
+@app.post("/chat/compare")
+async def chat_compare(request: Request):
+    """Run a query through multiple strategy configurations for A/B comparison.
+
+    Accepts a query and a list of named strategy configs, executes the pipeline
+    sequentially for each, and returns all results in a single response.
+    """
+    from backend.models import CompareRequest, QueryStrategies
+
+    body = await request.json()
+    compare_req = CompareRequest(**body)
+
+    results = []
+    for config in compare_req.configs:
+        config_name = config.get("name", "unknown")
+        strategies = QueryStrategies(
+            multi_query=config.get("multi_query", False),
+            hyde=config.get("hyde", False),
+            step_back=config.get("step_back", False),
+            decomposition=config.get("decomposition", False),
+            page_index=config.get("page_index", False),
+        )
+
+        initial_state = {
+            "query": compare_req.query,
+            "expanded_queries": [],
+            "target_articles": [],
+            "documents": [],
+            "web_snippets": [],
+            "generation": "",
+            "retrieval_grade": "",
+            "hallucination_grade": "",
+            "answer_grade": "",
+            "steps": 0,
+            "active_strategies": strategies,
+            "hallucination_retries": 0,
+            "answer_retries": 0,
+        }
+
+        import time as time_mod
+        start = time_mod.monotonic()
+        try:
+            final_state = await agent_app.ainvoke(initial_state)
+            latency = time_mod.monotonic() - start
+
+            sources = [
+                {
+                    "title": doc.get("title", ""),
+                    "content": doc.get("content", doc.get("page_content", "")),
+                    "score": doc.get("score", 0.0),
+                    "url": doc.get("url", ""),
+                }
+                for doc in final_state.get("documents", [])
+            ]
+
+            results.append({
+                "config_name": config_name,
+                "answer": final_state.get("generation", ""),
+                "sources": sources,
+                "metadata": {
+                    "agent_steps": final_state.get("steps", 0),
+                    "hallucination_retries": final_state.get("hallucination_retries", 0),
+                    "retrieval_grade": final_state.get("retrieval_grade", ""),
+                    "answer_grade": final_state.get("answer_grade", ""),
+                },
+                "latency": round(latency, 3),
+            })
+        except Exception as exc:
+            latency = time_mod.monotonic() - start
+            results.append({
+                "config_name": config_name,
+                "answer": f"Error: {exc}",
+                "sources": [],
+                "metadata": {},
+                "latency": round(latency, 3),
+                "error": str(exc),
+            })
+
+    return {"query": compare_req.query, "results": results}
+

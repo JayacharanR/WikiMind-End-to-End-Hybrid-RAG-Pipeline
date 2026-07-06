@@ -62,6 +62,26 @@ class ChatRequest(BaseModel):
     )
 
 
+class CompareRequest(BaseModel):
+    """Request body for the ``POST /chat/compare`` endpoint.
+
+    Accepts a single query and a list of named strategy configurations to
+    run in sequence for side-by-side comparison.
+    """
+
+    query: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        description="The user's natural language query.",
+    )
+    configs: list[dict] = Field(
+        ...,
+        min_length=2,
+        description="List of strategy config dicts, each with a 'name' key and strategy booleans.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Response Schemas
 # ---------------------------------------------------------------------------
