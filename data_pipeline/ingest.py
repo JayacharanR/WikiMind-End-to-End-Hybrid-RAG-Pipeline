@@ -183,7 +183,14 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
 
     points = []
     
-    # 1. Chunking
+    # 1. Chunking + Entity Extraction
+    try:
+        from backend.knowledge_graph import extract_entities
+        do_ner = True
+    except Exception:
+        logger.debug("spaCy NER unavailable; skipping entity extraction.")
+        do_ner = False
+
     for article in articles:
         title = article.get("title", "Unknown")
         text = article.get("text", "")
@@ -193,13 +200,14 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
         
         for i, chunk_text in enumerate(chunks):
             point_id = generate_point_id(title, i)
+            entities = extract_entities(chunk_text) if do_ner else []
             points.append({
                 "id": point_id,
                 "text": chunk_text,
                 "title": title,
                 "url": url,
                 "chunk_index": i,
-                "full_text": text if i == 0 else "" # Store full text only on the first chunk to save space, or omitted for now
+                "entities": entities,
             })
 
     if not points:
@@ -233,6 +241,7 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
             "url": point_data["url"],
             "page_content": point_data["text"],
             "chunk_index": point_data["chunk_index"],
+            "entities": point_data.get("entities", []),
         }
         
         qdrant_points.append(

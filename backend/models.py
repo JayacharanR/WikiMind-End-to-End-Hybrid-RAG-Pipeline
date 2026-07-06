@@ -41,6 +41,10 @@ class QueryStrategies(BaseModel):
         default=False,
         description="Enable vectorless PageIndex tree navigation for deep extraction.",
     )
+    knowledge_graph: bool = Field(
+        default=False,
+        description="Enable knowledge graph traversal for multi-hop entity queries.",
+    )
 
 
 class ChatRequest(BaseModel):

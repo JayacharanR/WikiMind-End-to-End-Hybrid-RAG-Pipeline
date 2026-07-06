@@ -113,6 +113,50 @@ async def node_identify_articles(state: AgentState) -> Dict:
         return {"target_articles": [], "web_snippets": [], "steps": steps}
 
 
+async def node_graph_search(state: AgentState) -> Dict:
+    """Node: Enrich retrieval with knowledge graph traversal.
+
+    Uses spaCy NER to extract entities from the query, then traverses the
+    co-occurrence knowledge graph (stored in Redis) up to 2 hops to find
+    related entities and their source articles. These are merged into the
+    target_articles list to broaden article-scoped retrieval.
+
+    Only runs when the ``knowledge_graph`` strategy is enabled.
+    """
+    query = state["query"]
+    target_articles = state.get("target_articles", [])
+    steps = state.get("steps", 0) + 1
+
+    logger.info("--- NODE: GRAPH SEARCH (step %d) ---", steps)
+
+    try:
+        from backend.knowledge_graph import graph_search
+
+        graph_results = await graph_search(query, max_hops=2, max_results=10)
+
+        # Extract unique source titles from graph traversal
+        graph_titles = set()
+        for result in graph_results:
+            source = result.get("source_title", "")
+            if source and source not in target_articles:
+                graph_titles.add(source)
+
+        # Merge graph-discovered articles with existing targets
+        merged = list(target_articles) + sorted(graph_titles)
+
+        logger.info(
+            "Graph search added %d article(s): %s",
+            len(graph_titles),
+            ", ".join(sorted(graph_titles)) if graph_titles else "(none)",
+        )
+
+        return {"target_articles": merged, "steps": steps}
+
+    except Exception as exc:
+        logger.warning("Graph search failed (non-fatal): %s", exc)
+        return {"steps": steps}
+
+
 async def node_retrieve(state: AgentState) -> Dict:
     """Node: Retrieve documents using article-scoped hybrid search.
 
@@ -429,7 +473,10 @@ def compile_agent_graph():
     """Compile the LangGraph state machine workflow.
 
     Graph topology:
-        expand_query -> identify_articles -> retrieve -> grade_documents
+        expand_query -> identify_articles
+            -> [if knowledge_graph enabled] -> graph_search -> retrieve
+            -> [if knowledge_graph disabled] -> retrieve
+        retrieve -> grade_documents
             -> [if irrelevant] -> generate_from_web -> END
             -> [if relevant]   -> generate -> check_hallucination
                 -> [if hallucinated, retries < 2] -> generate (retry)
@@ -442,6 +489,7 @@ def compile_agent_graph():
     # Add nodes
     workflow.add_node("expand_query", node_expand_query)
     workflow.add_node("identify_articles", node_identify_articles)
+    workflow.add_node("graph_search", node_graph_search)
     workflow.add_node("retrieve", node_retrieve)
     workflow.add_node("grade_documents", node_grade_documents)
     workflow.add_node("generate_from_web", node_generate_from_web)
@@ -454,10 +502,27 @@ def compile_agent_graph():
 
     # Standard edges
     workflow.add_edge("expand_query", "identify_articles")
-    workflow.add_edge("identify_articles", "retrieve")
+    workflow.add_edge("graph_search", "retrieve")
     workflow.add_edge("retrieve", "grade_documents")
     workflow.add_edge("generate_from_web", END)
     workflow.add_edge("generate", "check_hallucination")
+
+    # Conditional: after identify_articles, optionally run graph_search
+    def route_after_identify(state: AgentState) -> Literal["graph_search", "retrieve"]:
+        """Route to graph_search if the knowledge_graph strategy is active."""
+        strategies = state.get("active_strategies")
+        if strategies and getattr(strategies, "knowledge_graph", False):
+            return "graph_search"
+        return "retrieve"
+
+    workflow.add_conditional_edges(
+        "identify_articles",
+        route_after_identify,
+        {
+            "graph_search": "graph_search",
+            "retrieve": "retrieve",
+        },
+    )
 
     # Conditional edges
     workflow.add_conditional_edges(
