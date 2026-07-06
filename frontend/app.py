@@ -66,6 +66,25 @@ def configure_sidebar() -> Dict[str, Any]:
     
     st.sidebar.divider()
     
+    st.sidebar.subheader("Time-Travel Mode")
+    time_travel = st.sidebar.toggle(
+        "Enable Time-Travel",
+        value=False,
+        help="Query the knowledge base as it existed on a specific date.",
+    )
+    as_of_date = None
+    if time_travel:
+        from datetime import date
+        selected_date = st.sidebar.date_input(
+            "As of date:",
+            value=date.today(),
+            help="Retrieve articles ingested on or before this date.",
+        )
+        as_of_date = selected_date.isoformat() + "T23:59:59Z"
+        st.sidebar.caption(f"Querying as of: {as_of_date}")
+
+    st.sidebar.divider()
+    
     st.sidebar.subheader("System Health")
     if st.sidebar.button("Check Backend Health"):
         try:
@@ -88,15 +107,19 @@ def configure_sidebar() -> Dict[str, Any]:
         "hyde": hyde,
         "step_back": step_back,
         "decomposition": decomposition,
+        "as_of_date": as_of_date,
     }
 
 
 def stream_chat_response(query: str, strategies: Dict[str, bool]):
     """Stream the response from the FastAPI SSE endpoint."""
+    as_of_date = strategies.pop("as_of_date", None)
     payload = {
         "query": query,
-        "strategies": strategies
+        "strategies": strategies,
     }
+    if as_of_date:
+        payload["as_of_date"] = as_of_date
     
     try:
         # Use requests to get the SSE stream

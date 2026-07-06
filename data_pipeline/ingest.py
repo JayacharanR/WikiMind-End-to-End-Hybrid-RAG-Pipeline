@@ -195,6 +195,8 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
         title = article.get("title", "Unknown")
         text = article.get("text", "")
         url = article.get("url", "")
+        revision_id = str(article.get("id", ""))
+        ingested_at = datetime.now(timezone.utc).isoformat()
         
         chunks = splitter.split_text(text)
         
@@ -208,6 +210,8 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
                 "url": url,
                 "chunk_index": i,
                 "entities": entities,
+                "revision_id": revision_id,
+                "ingested_at": ingested_at,
             })
 
     if not points:
@@ -242,6 +246,9 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
             "page_content": point_data["text"],
             "chunk_index": point_data["chunk_index"],
             "entities": point_data.get("entities", []),
+            "revision_id": point_data.get("revision_id", ""),
+            "ingested_at": point_data.get("ingested_at", ""),
+            "is_current": True,
         }
         
         qdrant_points.append(

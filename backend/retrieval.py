@@ -79,13 +79,19 @@ def extract_title_from_wikipedia_url(url: str) -> Optional[str]:
 async def hybrid_search(
     query: str,
     article_titles: Optional[List[str]] = None,
+    as_of_date: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Execute a hybrid dense+sparse search using Qdrant Prefetch API for RRF.
 
     When ``article_titles`` is provided, the search is scoped to only chunks
     whose ``title`` payload field matches one of the given titles. This
     dramatically reduces noise by restricting retrieval to the specific
-    Wikipedia articles identified by the web-search discovery step.
+    Wikipedia articles identified by the article discovery step.
+
+    When ``as_of_date`` is provided (ISO format string), performs a time-travel
+    query by filtering chunks ingested on or before that date, regardless of
+    their ``is_current`` status. Otherwise, defaults to only returning chunks
+    with ``is_current=true``.
 
     The cross-encoder reranker is always applied to ensure maximum precision.
 
@@ -93,6 +99,7 @@ async def hybrid_search(
         query: The natural language search query.
         article_titles: Optional list of Wikipedia article titles to scope
             the search to. When None, searches the entire collection.
+        as_of_date: Optional ISO date string for time-travel queries.
 
     Returns:
         Tuple of (List of candidate documents, Metadata dict).
@@ -113,22 +120,43 @@ async def hybrid_search(
         values=sparse_obj.values.tolist(),
     )
 
-    # Build optional article-scope filter
-    query_filter = None
+    # Build filter conditions
+    filter_conditions = []
+
+    # Article scope filter
     if article_titles:
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="title",
-                    match=models.MatchAny(any=article_titles),
-                )
-            ]
+        filter_conditions.append(
+            models.FieldCondition(
+                key="title",
+                match=models.MatchAny(any=article_titles),
+            )
         )
         logger.info(
             "Scoping hybrid search to %d article(s): %s",
             len(article_titles),
             ", ".join(article_titles[:5]),
         )
+
+    # Temporal filter
+    if as_of_date:
+        # Time-travel mode: return chunks ingested on or before the given date
+        filter_conditions.append(
+            models.FieldCondition(
+                key="ingested_at",
+                range=models.Range(lte=as_of_date),
+            )
+        )
+        logger.info("Time-travel mode: as_of_date=%s", as_of_date)
+    else:
+        # Default mode: only return current version of chunks
+        filter_conditions.append(
+            models.FieldCondition(
+                key="is_current",
+                match=models.MatchValue(value=True),
+            )
+        )
+
+    query_filter = models.Filter(must=filter_conditions) if filter_conditions else None
 
     # Qdrant Prefetch API for server-side Reciprocal Rank Fusion
     prefetch_dense = models.Prefetch(

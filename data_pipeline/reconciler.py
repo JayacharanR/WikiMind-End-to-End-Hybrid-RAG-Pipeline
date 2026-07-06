@@ -66,17 +66,110 @@ async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
 
 
 async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]) -> List[str]:
-    """Check live Wikipedia for the given titles and identify stale ones.
-    
-    For MVP, we just re-fetch and re-upsert if we select it during reconciliation.
-    A true reconciliation would store the last 'revid' in Qdrant and compare it
-    here. Since we don't have revid in Qdrant payload yet, we'll simulate drift
-    detection by randomly picking a small percentage to "refresh".
+    """Check live Wikipedia revisions and compare to stored revision_ids.
+
+    Queries the MediaWiki API for the latest revision ID of each title,
+    then scrolls the Qdrant collection to find the stored revision_id for
+    each article. Articles where the stored revision_id differs from (or
+    is older than) the live revision are flagged as stale.
+
+    Args:
+        session: aiohttp session for API requests.
+        titles: List of article titles to check.
+
+    Returns:
+        List of titles that have drifted and need re-ingestion.
     """
-    # TODO: Implement true revid comparison.
-    # For now, simulate drift on 5% of sampled titles
-    stale_titles = [t for t in titles if random.random() < 0.05]
+    if not titles:
+        return []
+
+    stale_titles = []
+
+    # Batch fetch live revision IDs from MediaWiki API (up to 50 per request)
+    for batch_start in range(0, len(titles), 50):
+        batch = titles[batch_start:batch_start + 50]
+        params = {
+            "action": "query",
+            "format": "json",
+            "titles": "|".join(batch),
+            "prop": "revisions",
+            "rvprop": "ids",
+            "rvlimit": "1",
+        }
+
+        try:
+            async with session.get(WIKI_API_URL, params=params, timeout=15) as resp:
+                if resp.status != 200:
+                    logger.warning("MediaWiki API returned HTTP %d", resp.status)
+                    continue
+
+                data = await resp.json()
+                pages = data.get("query", {}).get("pages", {})
+
+                for page_id, page_data in pages.items():
+                    if page_id == "-1":
+                        continue
+                    page_title = page_data.get("title", "")
+                    revisions = page_data.get("revisions", [])
+                    if not revisions:
+                        continue
+
+                    live_revid = str(revisions[0].get("revid", ""))
+
+                    # Fetch stored revision_id from Qdrant
+                    stored_revid = await _get_stored_revision(page_title)
+
+                    if stored_revid and stored_revid != live_revid:
+                        logger.info(
+                            "Drift detected for '%s': stored=%s, live=%s",
+                            page_title, stored_revid, live_revid,
+                        )
+                        stale_titles.append(page_title)
+                    elif not stored_revid:
+                        # No revision_id stored (legacy data), flag for refresh
+                        stale_titles.append(page_title)
+
+        except Exception as exc:
+            logger.warning("Error checking live revisions: %s", exc)
+
     return stale_titles
+
+
+async def _get_stored_revision(title: str) -> str:
+    """Retrieve the stored revision_id for an article from Qdrant.
+
+    Scrolls for a single chunk matching the title and returns its
+    revision_id payload field.
+    """
+    qdrant = get_async_qdrant()
+    settings = get_settings()
+
+    try:
+        from qdrant_client.http import models as qmodels
+        results, _ = await qdrant.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="title",
+                        match=qmodels.MatchValue(value=title),
+                    ),
+                    qmodels.FieldCondition(
+                        key="is_current",
+                        match=qmodels.MatchValue(value=True),
+                    ),
+                ]
+            ),
+            limit=1,
+            with_payload=["revision_id"],
+            with_vectors=False,
+        )
+        if results:
+            return results[0].payload.get("revision_id", "")
+    except Exception as exc:
+        logger.warning("Error reading stored revision for '%s': %s", title, exc)
+
+    return ""
 
 
 async def run_reconciliation_cycle():

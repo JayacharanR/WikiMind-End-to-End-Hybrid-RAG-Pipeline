@@ -64,6 +64,10 @@ class ChatRequest(BaseModel):
         default=None,
         description="Optional session identifier for conversation continuity.",
     )
+    as_of_date: Optional[str] = Field(
+        default=None,
+        description="Optional ISO date for time-travel queries (e.g., '2024-06-15T00:00:00Z').",
+    )
 
 
 class CompareRequest(BaseModel):

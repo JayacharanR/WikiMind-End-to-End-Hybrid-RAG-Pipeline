@@ -56,15 +56,20 @@ async def fetch_article_text(session: aiohttp.ClientSession, title: str) -> Opti
 
 
 async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSession) -> None:
-    """Process a single Wikipedia edit event."""
+    """Process a single Wikipedia edit event with version-aware upserts.
+
+    Before inserting new chunks, marks all existing chunks for the article
+    as ``is_current=false`` so time-travel queries can distinguish versions.
+    """
     title = event_data.get("title")
     meta = event_data.get("meta", {})
     uri = meta.get("uri", "")
+    revision_id = str(event_data.get("revision", {}).get("new", ""))
     
     if not title:
         return
 
-    logger.info("Processing update for: %s", title)
+    logger.info("Processing update for: %s (revision %s)", title, revision_id)
     
     # 1. Fetch updated content
     text = await fetch_article_text(session, title)
@@ -82,19 +87,41 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     if not chunks:
         return
 
-    # 3. Embedding
-    dense_model = get_dense_model()
-    sparse_model = get_sparse_model()
-    
-    # Run embedding in sync models (since fastembed is sync, we'd normally run this in an executor, 
-    # but for this script we just block briefly or use asyncio.to_thread in production)
-    dense_embeddings = list(dense_model.embed(chunks))
-    sparse_embeddings = list(sparse_model.embed(chunks))
-
-    # 4. Upsert to Qdrant
+    # 3. Mark existing chunks as not current (version archival)
     qdrant = get_async_qdrant()
     settings = get_settings()
     
+    try:
+        await qdrant.set_payload(
+            collection_name=settings.qdrant_collection,
+            payload={"is_current": False},
+            points=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="title",
+                        match=models.MatchValue(value=title),
+                    ),
+                    models.FieldCondition(
+                        key="is_current",
+                        match=models.MatchValue(value=True),
+                    ),
+                ]
+            ),
+        )
+        logger.debug("Archived existing chunks for: %s", title)
+    except Exception as exc:
+        logger.warning("Failed to archive old chunks for %s: %s", title, exc)
+
+    # 4. Embedding
+    dense_model = get_dense_model()
+    sparse_model = get_sparse_model()
+    dense_embeddings = list(dense_model.embed(chunks))
+    sparse_embeddings = list(sparse_model.embed(chunks))
+
+    # 5. Build new versioned points
+    from datetime import datetime, timezone
+    ingested_at = datetime.now(timezone.utc).isoformat()
+
     qdrant_points = []
     for i, chunk_text in enumerate(chunks):
         point_id = generate_point_id(title, i)
@@ -115,17 +142,18 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
                     "url": uri,
                     "page_content": chunk_text,
                     "chunk_index": i,
+                    "revision_id": revision_id,
+                    "ingested_at": ingested_at,
+                    "is_current": True,
                 }
             )
         )
 
-    # Note: A true idempotent update also requires deleting old chunks if the new article
-    # is shorter than the old one. For MVP, we just overwrite existing indices.
     await qdrant.upsert(
         collection_name=settings.qdrant_collection,
         points=qdrant_points
     )
-    logger.debug("Successfully updated %s (%d chunks)", title, len(chunks))
+    logger.debug("Successfully updated %s (%d chunks, revision %s)", title, len(chunks), revision_id)
 
 
 async def listen_to_stream():

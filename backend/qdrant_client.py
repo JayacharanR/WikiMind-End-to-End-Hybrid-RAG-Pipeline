@@ -98,6 +98,18 @@ def init_collection() -> None:
             field_name="title",
             field_schema=models.PayloadSchemaType.KEYWORD,
         )
+
+        # Temporal versioning payload indices
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name="is_current",
+            field_schema=models.PayloadSchemaType.BOOL,
+        )
+        client.create_payload_index(
+            collection_name=collection_name,
+            field_name="ingested_at",
+            field_schema=models.PayloadSchemaType.KEYWORD,
+        )
         
         logger.info("Collection '%s' created successfully.", collection_name)
     except Exception as exc:
