@@ -1,0 +1,11 @@
+{
+  "name": "baseline",
+  "description": "Default pipeline configuration with no query expansion strategies enabled.",
+  "strategies": {
+    "multi_query": false,
+    "hyde": false,
+    "step_back": false,
+    "decomposition": false,
+    "page_index": false
+  }
+}

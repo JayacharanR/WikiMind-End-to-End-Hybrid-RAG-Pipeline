@@ -1,0 +1,14 @@
+{
+  "name": "no_reranker",
+  "description": "Pipeline with cross-encoder reranker disabled. Useful for measuring reranker impact on precision.",
+  "strategies": {
+    "multi_query": false,
+    "hyde": false,
+    "step_back": false,
+    "decomposition": false,
+    "page_index": false
+  },
+  "overrides": {
+    "reranker_top_k": 0
+  }
+}

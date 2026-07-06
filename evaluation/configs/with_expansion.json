@@ -1,0 +1,11 @@
+{
+  "name": "with_expansion",
+  "description": "Pipeline with multi-query reformulation and step-back abstraction enabled for broader recall.",
+  "strategies": {
+    "multi_query": true,
+    "hyde": false,
+    "step_back": true,
+    "decomposition": false,
+    "page_index": false
+  }
+}
