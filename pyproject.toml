@@ -32,8 +32,9 @@ dependencies = [
     # Data Pipeline
     "datasets>=3.0.0",
     "aiohttp>=3.11.0",
-    # External Search
-    "tavily-python>=0.5.0",
+    # Knowledge Graph (Phase 4)
+    "spacy>=3.7.0",
+    "networkx>=3.0",
     # Utilities
     "python-dotenv>=1.2.2",
     "httpx>=0.28.0",
@@ -42,12 +43,18 @@ dependencies = [
     "sseclient-py>=1.9.0",
 ]
 
+[project.optional-dependencies]
+tavily = ["tavily-python>=0.5.0"]
+eval = ["pandas", "tabulate"]
+mobile = ["onnxruntime", "onnx"]
+
 [project.urls]
-Repository = "https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline"
+Repository = "https://github.com/JayacharanR/WikiMind-End-to-End-Hybrid-RAG-Pipeline"
 
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
-packages = ["backend", "frontend", "data_pipeline"]
+packages = ["backend", "frontend", "data_pipeline", "evaluation", "mobile"]
+

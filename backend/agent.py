@@ -1,22 +1,22 @@
 """Agentic Orchestration (Search-Scoped CRAG/Self-RAG).
 
 Defines the LangGraph state machine orchestrating the Search-Scoped Hybrid RAG
-pipeline. Uses Tavily web search (scoped to en.wikipedia.org) to identify
-relevant Wikipedia articles, then performs article-scoped hybrid retrieval in
-Qdrant. Implements batched document grading, hallucination checking, and answer
-quality loops with separate retry counters and a hard step budget.
+pipeline. Uses a local article-level Qdrant index (``wikimind_articles``) to
+identify relevant Wikipedia articles, then performs article-scoped hybrid
+retrieval in Qdrant. Implements batched document grading, hallucination
+checking, and answer quality loops with separate retry counters and a hard
+step budget.
 """
 
 import json
 import logging
 from typing import Dict, List, Literal, TypedDict
 from urllib.parse import unquote, urlparse
-
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_openai import ChatOpenAI
 from langgraph.graph import END, StateGraph
-from tavily import TavilyClient
 
+from backend.article_index import search_articles
 from backend.config import get_settings
 from backend.llmops import get_langfuse_handler, safe_generate
 from backend.models import QueryStrategies
@@ -80,73 +80,45 @@ async def node_expand_query(state: AgentState) -> Dict:
 
 
 async def node_identify_articles(state: AgentState) -> Dict:
-    """Node: Use Tavily web search scoped to en.wikipedia.org to identify
-    the most relevant Wikipedia article(s) for the query.
+    """Node: Search the local article-level Qdrant index to identify the
+    most relevant Wikipedia article(s) for the query.
 
-    Extracts article titles from Wikipedia URLs in the search results.
-    Also stores the web snippets as fallback context in case the scoped
-    Qdrant search returns no results (article not yet ingested).
+    Uses the ``wikimind_articles`` collection (dense-only, one vector per
+    article built from title + first two paragraphs) to find the top-K
+    articles. This replaces the previous Tavily web search, making the
+    pipeline fully offline with no external API dependencies for retrieval.
     """
     query = state["query"]
     steps = state.get("steps", 0) + 1
 
     logger.info("--- NODE: IDENTIFY ARTICLES (step %d) ---", steps)
 
-    settings = get_settings()
-    if not settings.tavily_api_key:
-        logger.warning("Tavily API key not configured. Skipping article identification.")
-        return {"target_articles": [], "web_snippets": [], "steps": steps}
-
-    client = TavilyClient(api_key=settings.tavily_api_key)
-
     try:
-        response = client.search(
-            query=query,
-            search_depth="basic",
-            max_results=settings.tavily_max_results,
-            include_domains=["en.wikipedia.org"],
-        )
-
-        target_articles = []
-        web_snippets = []
-
-        for result in response.get("results", []):
-            url = result.get("url", "")
-            title = extract_title_from_wikipedia_url(url)
-            if title and title not in target_articles:
-                target_articles.append(title)
-
-            # Store the snippet as fallback context
-            web_snippets.append({
-                "id": url,
-                "title": title or result.get("title", "Web Result"),
-                "content": result.get("content", ""),
-                "url": url,
-                "score": result.get("score", 0.0),
-            })
+        target_articles = await search_articles(query)
 
         logger.info(
-            "Tavily identified %d Wikipedia article(s): %s",
+            "Local article index identified %d article(s): %s",
             len(target_articles),
             ", ".join(target_articles),
         )
 
         return {
             "target_articles": target_articles,
-            "web_snippets": web_snippets,
+            "web_snippets": [],
             "steps": steps,
         }
 
     except Exception as exc:
-        logger.error("Tavily article identification failed: %s", exc)
+        logger.error("Article index search failed: %s", exc)
         return {"target_articles": [], "web_snippets": [], "steps": steps}
 
 
 async def node_retrieve(state: AgentState) -> Dict:
     """Node: Retrieve documents using article-scoped hybrid search.
 
-    Uses the article titles identified by Tavily to filter the Qdrant
-    search. If no articles were identified, falls back to unscoped search.
+    Uses the article titles identified by the article-level index to filter
+    the Qdrant search. If no articles were identified, falls back to unscoped
+    search across the entire collection.
     """
     queries_to_search = state.get("expanded_queries", [state["query"]])
     target_articles = state.get("target_articles", [])
@@ -264,17 +236,17 @@ async def node_grade_documents(state: AgentState) -> Dict:
 
 
 async def node_generate_from_web(state: AgentState) -> Dict:
-    """Node: Generate a response using Tavily web snippets as fallback context.
+    """Node: Generate a response using fallback context.
 
-    Called when scoped retrieval returns no relevant documents and the
-    pipeline falls back to the web search snippets collected during
-    article identification.
+    Called when scoped retrieval returns no relevant documents. Uses any
+    available web snippets or generates a response acknowledging that no
+    relevant context was found.
     """
     query = state["query"]
     web_snippets = state.get("web_snippets", [])
     steps = state.get("steps", 0) + 1
 
-    logger.info("--- NODE: GENERATE FROM WEB SNIPPETS (step %d) ---", steps)
+    logger.info("--- NODE: GENERATE FALLBACK (step %d) ---", steps)
 
     if web_snippets:
         context = "\n\n".join(
@@ -407,8 +379,8 @@ def _is_over_budget(state: AgentState) -> bool:
 def route_after_grading(state: AgentState) -> Literal["generate_from_web", "generate"]:
     """Route based on document relevance after grading.
 
-    If no relevant documents remain, fall back to generating from
-    the Tavily web snippets collected during article identification.
+    If no relevant documents remain, fall back to generating a response
+    without grounded context.
     """
     if state.get("retrieval_grade") == "irrelevant":
         return "generate_from_web"
@@ -516,7 +488,7 @@ def compile_agent_graph():
     )
 
     app = workflow.compile()
-    logger.info("Search-Scoped CRAG/Self-RAG workflow compiled successfully.")
+    logger.info("Two-Stage CRAG/Self-RAG workflow compiled successfully.")
     return app
 
 

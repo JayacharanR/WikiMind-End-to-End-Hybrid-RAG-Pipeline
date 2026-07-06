@@ -40,6 +40,8 @@ class Settings(BaseSettings):
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "wikimind_hybrid"
+    article_collection: str = "wikimind_articles"
+    article_search_top_k: int = 3
 
     # --- Redis / Semantic Cache -------------------------------------------
     redis_url: str = "redis://localhost:6379"

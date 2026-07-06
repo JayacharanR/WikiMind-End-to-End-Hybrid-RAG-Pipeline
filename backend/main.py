@@ -51,10 +51,12 @@ async def lifespan(app: FastAPI):
     from backend.llmops import get_guardrails
     get_guardrails()
     
-    # Initialize Qdrant collection
+    # Initialize Qdrant collections (chunk-level + article-level)
     from backend.qdrant_client import init_collection
+    from backend.article_index import init_article_collection
     import asyncio
     await asyncio.to_thread(init_collection)
+    await asyncio.to_thread(init_article_collection)
 
     logger.info("WikiMind Backend ready on %s:%d", settings.app_host, settings.app_port)
 

@@ -2,8 +2,11 @@
 
 Streams the English Wikipedia dataset from Hugging Face, chunks the text,
 generates dual embeddings (dense and sparse BM25), and upserts the data
-into Qdrant. Uses checkpointing to resume from the last processed article
-in case of failure.
+into Qdrant. Also generates article-level embeddings for the two-stage
+retrieval architecture (``wikimind_articles`` collection).
+
+Uses checkpointing to resume from the last processed article in case of
+failure.
 """
 
 import argparse
@@ -83,15 +86,88 @@ def save_checkpoint(articles_processed: int) -> None:
 
 
 # ---------------------------------------------------------------------------
+# Article-Level Indexing
+# ---------------------------------------------------------------------------
+
+def _upsert_article_entries(articles: List[Dict[str, Any]]) -> None:
+    """Generate article-level embeddings and upsert to wikimind_articles.
+
+    For each article, concatenates the title with the first two paragraphs
+    (capped at 1500 chars) to produce a single dense embedding. This enables
+    Stage 1 of the two-stage retrieval architecture.
+    """
+    from backend.article_index import extract_article_summary, generate_article_id
+
+    settings = get_settings()
+    client = get_sync_qdrant()
+    dense_model = get_dense_model()
+
+    summaries = []
+    article_data = []
+
+    for article in articles:
+        title = article.get("title", "Unknown")
+        text = article.get("text", "")
+        url = article.get("url", "")
+
+        summary_text = extract_article_summary(title, text)
+        summaries.append(summary_text)
+        article_data.append({
+            "id": generate_article_id(title),
+            "title": title,
+            "url": url,
+            "paragraph_preview": summary_text[:500],
+        })
+
+    if not summaries:
+        return
+
+    # Embed all article summaries in one batch
+    embeddings = list(dense_model.embed(summaries))
+
+    # Assemble Qdrant points
+    points = []
+    for i, data in enumerate(article_data):
+        points.append(
+            models.PointStruct(
+                id=data["id"],
+                vector=embeddings[i].tolist(),
+                payload={
+                    "title": data["title"],
+                    "url": data["url"],
+                    "paragraph_preview": data["paragraph_preview"],
+                },
+            )
+        )
+
+    client.upsert(
+        collection_name=settings.article_collection,
+        points=points,
+    )
+    logger.debug("Upserted %d article-level entries.", len(points))
+
+
+# ---------------------------------------------------------------------------
 # Ingestion Pipeline
 # ---------------------------------------------------------------------------
 
-def process_batch(articles: List[Dict[str, Any]]) -> None:
+def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -> None:
     """Process a batch of Wikipedia articles.
 
-    Chunks the text, embeds it, and upserts to Qdrant.
+    Chunks the text, embeds it, and upserts to Qdrant. Also generates
+    article-level embeddings for the two-stage retrieval index.
+
+    Args:
+        articles: List of article dicts from the HuggingFace dataset.
+        articles_only: If True, only upsert article-level entries (skip chunks).
     """
     if not articles:
+        return
+
+    # Always upsert article-level entries
+    _upsert_article_entries(articles)
+
+    if articles_only:
         return
 
     settings = get_settings()
@@ -176,13 +252,21 @@ def process_batch(articles: List[Dict[str, Any]]) -> None:
     logger.debug("Upserted %d chunks from %d articles.", len(qdrant_points), len(articles))
 
 
-def run_ingestion(max_articles: int = 1000, batch_size: int = 50) -> None:
+def run_ingestion(max_articles: int = 1000, batch_size: int = 50, articles_only: bool = False) -> None:
     """Run the ingestion pipeline.
 
     Streams the Wikipedia dataset, processing it in batches. Resumes from the
     last saved checkpoint.
+
+    Args:
+        max_articles: Maximum number of articles to process (0 for unlimited).
+        batch_size: Number of articles per batch.
+        articles_only: If True, only build the article-level index (skip chunks).
     """
+    from backend.article_index import init_article_collection
+
     init_collection()
+    init_article_collection()
     
     processed_count = load_checkpoint()
     logger.info("Starting ingestion. Resuming from %d articles.", processed_count)
@@ -205,7 +289,7 @@ def run_ingestion(max_articles: int = 1000, batch_size: int = 50) -> None:
             batch.append(article)
             
             if len(batch) >= batch_size:
-                process_batch(batch)
+                process_batch(batch, articles_only=articles_only)
                 processed_count += len(batch)
                 save_checkpoint(processed_count)
                 
@@ -221,7 +305,7 @@ def run_ingestion(max_articles: int = 1000, batch_size: int = 50) -> None:
                     
         # Process any remaining
         if batch and (max_articles <= 0 or processed_count < max_articles):
-            process_batch(batch)
+            process_batch(batch, articles_only=articles_only)
             processed_count += len(batch)
             save_checkpoint(processed_count)
             logger.info("Processed final batch. Total: %d articles.", processed_count)
@@ -236,6 +320,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WikiMind Wikipedia Ingestion Script")
     parser.add_argument("--max", type=int, default=1000, help="Maximum number of articles to process (0 for unlimited)")
     parser.add_argument("--batch", type=int, default=50, help="Number of articles per batch")
+    parser.add_argument("--articles-only", action="store_true", help="Only build the article-level index (skip chunk embedding)")
     args = parser.parse_args()
     
-    run_ingestion(max_articles=args.max, batch_size=args.batch)
+    run_ingestion(max_articles=args.max, batch_size=args.batch, articles_only=args.articles_only)

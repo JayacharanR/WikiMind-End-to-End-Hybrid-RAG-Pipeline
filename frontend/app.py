@@ -29,9 +29,9 @@ def configure_sidebar() -> Dict[str, Any]:
     
     st.sidebar.subheader("Retrieval Architecture")
     st.sidebar.markdown(
-        "WikiMind uses **Search-Scoped Hybrid RAG**: Tavily identifies the "
-        "relevant Wikipedia articles, then Qdrant hybrid search (Dense + "
-        "Sparse + RRF + Reranker) extracts precise chunks from those articles."
+        "WikiMind uses **Two-Stage Hybrid RAG**: a local article-level index "
+        "identifies the relevant Wikipedia articles, then Qdrant hybrid search "
+        "(Dense + Sparse + RRF + Reranker) extracts precise chunks from those articles."
     )
     
     st.sidebar.divider()
@@ -167,7 +167,7 @@ def main():
     )
     
     st.title("WikiMind RAG Pipeline")
-    st.markdown("Ask complex questions. The agent uses Search-Scoped Hybrid RAG: Tavily identifies Wikipedia articles, then Qdrant hybrid search extracts precise answers.")
+    st.markdown("Ask complex questions. The agent uses Two-Stage Hybrid RAG: a local article index identifies Wikipedia articles, then Qdrant hybrid search extracts precise answers.")
     
     # Sidebar config
     strategies = configure_sidebar()
