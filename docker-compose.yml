@@ -120,7 +120,7 @@ services:
       resources:
         limits:
           cpus: '2'
-          memory: 8G
+          memory: 4G
 
   redis:
     image: redis/redis-stack-server:latest

@@ -152,7 +152,11 @@ def _upsert_article_entries(articles: List[Dict[str, Any]]) -> None:
 # Ingestion Pipeline
 # ---------------------------------------------------------------------------
 
-def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -> None:
+def process_batch(
+    articles: List[Dict[str, Any]],
+    articles_only: bool = False,
+    skip_ner: bool = False,
+) -> None:
     """Process a batch of Wikipedia articles.
 
     Chunks the text, embeds it, and upserts to Qdrant. Also generates
@@ -161,6 +165,7 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
     Args:
         articles: List of article dicts from the HuggingFace dataset.
         articles_only: If True, only upsert article-level entries (skip chunks).
+        skip_ner: If True, skip spaCy NER entity extraction (faster ingestion).
     """
     if not articles:
         return
@@ -185,12 +190,13 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
     points = []
     
     # 1. Chunking + Entity Extraction
-    try:
-        from backend.knowledge_graph import extract_entities
-        do_ner = True
-    except Exception:
-        logger.debug("spaCy NER unavailable; skipping entity extraction.")
-        do_ner = False
+    do_ner = False
+    if not skip_ner:
+        try:
+            from backend.knowledge_graph import extract_entities
+            do_ner = True
+        except Exception:
+            logger.debug("spaCy NER unavailable; skipping entity extraction.")
 
     for article in articles:
         title = article.get("title", "Unknown")
@@ -260,16 +266,24 @@ def process_batch(articles: List[Dict[str, Any]], articles_only: bool = False) -
             )
         )
 
-    # 4. Upsert
-    client.upsert(
-        collection_name=settings.qdrant_collection,
-        points=qdrant_points
-    )
+    # 4. Upsert in sub-batches (Qdrant has a 33 MB JSON payload limit)
+    UPSERT_BATCH = 200
+    for sub_start in range(0, len(qdrant_points), UPSERT_BATCH):
+        sub_batch = qdrant_points[sub_start : sub_start + UPSERT_BATCH]
+        client.upsert(
+            collection_name=settings.qdrant_collection,
+            points=sub_batch,
+        )
     
     logger.debug("Upserted %d chunks from %d articles.", len(qdrant_points), len(articles))
 
 
-def run_ingestion(max_articles: int = 1000, batch_size: int = 50, articles_only: bool = False) -> None:
+def run_ingestion(
+    max_articles: int = 1000,
+    batch_size: int = 50,
+    articles_only: bool = False,
+    skip_ner: bool = False,
+) -> None:
     """Run the ingestion pipeline.
 
     Streams the Wikipedia dataset, processing it in batches. Resumes from the
@@ -279,6 +293,7 @@ def run_ingestion(max_articles: int = 1000, batch_size: int = 50, articles_only:
         max_articles: Maximum number of articles to process (0 for unlimited).
         batch_size: Number of articles per batch.
         articles_only: If True, only build the article-level index (skip chunks).
+        skip_ner: If True, skip spaCy NER entity extraction (faster ingestion).
     """
     from backend.article_index import init_article_collection
 
@@ -286,43 +301,62 @@ def run_ingestion(max_articles: int = 1000, batch_size: int = 50, articles_only:
     init_article_collection()
     
     processed_count = load_checkpoint()
-    logger.info("Starting ingestion. Resuming from %d articles.", processed_count)
+    target_label = str(max_articles) if max_articles > 0 else "unlimited"
+    logger.info(
+        "Starting ingestion. Target: %s articles. Resuming from %d. NER: %s.",
+        target_label, processed_count, "off" if skip_ner else "on",
+    )
     
     # Load wikipedia dataset in streaming mode
     dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
     
     # Skip already processed
     if processed_count > 0:
-        logger.info("Skipping first %d articles...", processed_count)
-        # Note: dataset.skip() can be slow for large numbers on streaming datasets
-        # A more robust implementation would use a sharded dataset or date-based filtering
+        logger.info("Skipping first %d articles (resuming from checkpoint)...", processed_count)
         dataset = dataset.skip(processed_count)
 
     batch = []
     start_time = time.monotonic()
+    articles_this_session = 0
     
     try:
         for article in dataset:
             batch.append(article)
             
             if len(batch) >= batch_size:
-                process_batch(batch, articles_only=articles_only)
+                process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
                 processed_count += len(batch)
+                articles_this_session += len(batch)
                 save_checkpoint(processed_count)
                 
                 elapsed = time.monotonic() - start_time
-                rate = processed_count / elapsed if elapsed > 0 else 0
-                logger.info("Processed %d articles. Rate: %.2f articles/sec", processed_count, rate)
+                rate = articles_this_session / elapsed if elapsed > 0 else 0
+
+                # ETA calculation
+                if max_articles > 0 and rate > 0:
+                    remaining = max_articles - processed_count
+                    eta_seconds = remaining / rate
+                    eta_h = int(eta_seconds // 3600)
+                    eta_m = int((eta_seconds % 3600) // 60)
+                    logger.info(
+                        "[%d/%s] %.1f articles/sec | ETA: %dh %dm",
+                        processed_count, target_label, rate, eta_h, eta_m,
+                    )
+                else:
+                    logger.info(
+                        "[%d/%s] %.1f articles/sec",
+                        processed_count, target_label, rate,
+                    )
                 
                 batch = []
                 
                 if max_articles > 0 and processed_count >= max_articles:
-                    logger.info("Reached maximum requested articles (%d). Stopping.", max_articles)
+                    logger.info("Reached target (%d articles). Done.", max_articles)
                     break
                     
         # Process any remaining
         if batch and (max_articles <= 0 or processed_count < max_articles):
-            process_batch(batch, articles_only=articles_only)
+            process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
             processed_count += len(batch)
             save_checkpoint(processed_count)
             logger.info("Processed final batch. Total: %d articles.", processed_count)
@@ -330,14 +364,27 @@ def run_ingestion(max_articles: int = 1000, batch_size: int = 50, articles_only:
     except KeyboardInterrupt:
         logger.info("Ingestion interrupted by user. Saved checkpoint at %d.", processed_count)
     except Exception as exc:
-        logger.error("Ingestion failed: %s", exc)
+        logger.error("Ingestion failed at article %d: %s", processed_count, exc)
         raise
+
+    elapsed = time.monotonic() - start_time
+    logger.info(
+        "Ingestion complete. Processed %d articles in %.0f minutes (%.1f articles/sec).",
+        articles_this_session, elapsed / 60, articles_this_session / elapsed if elapsed > 0 else 0,
+    )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="WikiMind Wikipedia Ingestion Script")
     parser.add_argument("--max", type=int, default=1000, help="Maximum number of articles to process (0 for unlimited)")
     parser.add_argument("--batch", type=int, default=50, help="Number of articles per batch")
     parser.add_argument("--articles-only", action="store_true", help="Only build the article-level index (skip chunk embedding)")
+    parser.add_argument("--skip-ner", action="store_true", help="Skip spaCy NER entity extraction (faster ingestion)")
     args = parser.parse_args()
     
-    run_ingestion(max_articles=args.max, batch_size=args.batch, articles_only=args.articles_only)
+    run_ingestion(
+        max_articles=args.max,
+        batch_size=args.batch,
+        articles_only=args.articles_only,
+        skip_ner=args.skip_ner,
+    )
