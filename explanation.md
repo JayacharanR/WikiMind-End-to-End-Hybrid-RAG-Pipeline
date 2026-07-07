@@ -1,249 +1,664 @@
-# WikiMind Architecture Decision: Why Search-Scoped Hybrid RAG?
+# WikiMind -- Complete Architecture and Pipeline Explanation
 
-This document explains the architectural reasoning behind WikiMind's retrieval
-design. It captures the key design questions that shaped the pipeline and why
-the final architecture uses **Tavily web search for article scoping** combined
-with a **local Hybrid RAG pipeline for chunk-level retrieval**.
+This document explains every layer of WikiMind in plain language: what it does,
+how it works, and why each design choice was made. It is written for someone
+encountering the project for the first time.
+
+---
+
+## Table of Contents
+
+1. [What is WikiMind?](#what-is-wikimind)
+2. [The Core Problem](#the-core-problem)
+3. [How the Data Gets Into the System](#how-the-data-gets-into-the-system)
+4. [How a Query Flows Through the System](#how-a-query-flows-through-the-system)
+5. [Detailed Component Breakdown](#detailed-component-breakdown)
+6. [Knowledge Graph Layer](#knowledge-graph-layer)
+7. [Temporal Versioning and Time-Travel](#temporal-versioning-and-time-travel)
+8. [Evaluation Harness](#evaluation-harness)
+9. [Architecture Diagrams](#architecture-diagrams)
+10. [Key Technical Decisions](#key-technical-decisions)
+
+---
+
+## What is WikiMind?
+
+WikiMind is a question-answering system backed by the English Wikipedia. You ask
+it a question in natural language, and it:
+
+1. Figures out which Wikipedia articles are relevant.
+2. Extracts the precise text passages that contain the answer.
+3. Generates a grounded, verified answer using an LLM.
+4. Checks its own answer for hallucinations and quality before returning it.
+
+It is NOT a chatbot wrapper around ChatGPT. It is a full retrieval-augmented
+generation (RAG) pipeline where the LLM never makes up facts -- it only
+synthesizes answers from text chunks that were actually retrieved from Wikipedia.
 
 ---
 
 ## The Core Problem
 
-WikiMind is a question-answering system backed by Wikipedia. The fundamental
-challenge is: **Wikipedia is enormous.** The English Wikipedia alone contains
-over 6.8 million articles. When ingested and chunked into a vector database,
-this produces tens of millions of text chunks.
+Wikipedia has over 6.8 million English articles. When you ingest and chunk those
+articles into a vector database, you get tens of millions of text fragments.
 
-When a user asks a question like *"What is the population of Tokyo?"*, a naive
-vector search across the entire corpus returns chunks from Tokyo, Osaka, Japan
-demographics, List of largest cities, Metropolitan areas, and dozens of
-tangentially related articles. The LLM then receives a context window full of
-noisy, loosely related chunks and either:
+If a user asks "What is the population of Tokyo?", a naive vector search across
+all those chunks returns results from Tokyo, Osaka, Japan demographics, List of
+largest cities, Metropolitan areas, and dozens of tangentially related articles.
+The LLM then receives a context window full of noisy, loosely related text and
+either hallucinates, loops, or gives a vague answer.
 
-- Produces a hallucinated answer by stitching together unrelated facts.
-- Fails the grounding check and loops back for another retrieval attempt.
-- Loops indefinitely without converging on a focused, correct answer.
-
-This is the **needle-in-a-haystack problem** applied to retrieval-augmented
-generation.
+WikiMind solves this with a **two-stage retrieval architecture**: first identify
+the right articles, then search only within those articles for the exact answer.
 
 ---
 
-## Three Candidate Architectures
+## How the Data Gets Into the System
 
-### Option A: Pure Vector-Search RAG (Original Design)
+This is the most important thing to understand: WikiMind does NOT query
+Wikipedia live when you ask a question. The entire Wikipedia corpus (or a subset
+of it) is pre-processed and stored locally. Here is exactly what happens:
 
+### Step 1: Download the Wikipedia Dataset
+
+The ingestion script (`data_pipeline/ingest.py`) streams the complete English
+Wikipedia dataset from HuggingFace (`wikimedia/wikipedia`, the November 2023
+snapshot). This dataset contains the full text of every English Wikipedia
+article -- approximately 6.8 million articles totaling around 21 GB of raw
+text.
+
+The script uses HuggingFace's streaming mode, which means it downloads articles
+one at a time without requiring the full 21 GB in memory or on disk upfront.
+
+### Step 2: Chunk Each Article
+
+Each article's text is split into overlapping chunks of 512 characters with
+64-character overlap, using LangChain's RecursiveCharacterTextSplitter. A single
+long Wikipedia article (say, 20,000 characters) becomes roughly 40 chunks. The
+chunking preserves paragraph boundaries when possible.
+
+### Step 3: Embed Each Chunk (Dual Embeddings)
+
+Every chunk gets two different embeddings generated locally (no API calls):
+
+1. **Dense embedding** -- Uses `BAAI/bge-small-en-v1.5` via FastEmbed. This is
+   a 384-dimensional vector that captures the semantic meaning of the text.
+   "Capital of France" and "Paris is the capital city" would have high cosine
+   similarity even though they share few words.
+
+2. **Sparse embedding** -- Uses `Qdrant/bm25` via FastEmbed. This is a
+   sparse vector (like traditional BM25/TF-IDF) that captures exact keyword
+   matches. "Population of Tokyo" scores high on chunks containing those exact
+   words.
+
+Both embeddings are generated entirely on your local machine using CPU-based
+models. No OpenAI or cloud API is called for embedding.
+
+### Step 4: Extract Named Entities
+
+Each chunk is also run through spaCy NER (Named Entity Recognition) to extract
+entities like person names, organizations, locations, and events. These entities
+are stored in the chunk's metadata and later used to build the knowledge graph.
+
+### Step 5: Store in Qdrant (Two Collections)
+
+The data is stored in Qdrant (a vector database running locally in Docker) in
+two separate collections:
+
+1. **`wikimind_hybrid`** -- Contains all the individual chunks with their dense
+   and sparse embeddings, plus metadata (title, URL, chunk index, entities,
+   revision ID, ingested timestamp, is_current flag). This is where the actual
+   retrieval happens.
+
+2. **`wikimind_articles`** -- Contains one entry per article (not per chunk).
+   Each entry stores a single dense embedding of the article's title +
+   first two paragraphs. This is used for Stage 1 article discovery.
+
+### Step 6: Build the Knowledge Graph (Optional)
+
+A separate script (`data_pipeline/graph_builder.py`) scrolls through all
+chunks in Qdrant, reads the pre-extracted entities, and builds a NetworkX
+co-occurrence graph. If "Albert Einstein" and "Theory of Relativity" appear in
+the same chunk, they get connected with an edge. This graph is serialized and
+stored in Redis.
+
+### What You Actually Need to Run
+
+By default, the ingestion script processes 1,000 articles:
+
+```bash
+python -m data_pipeline.ingest --max 1000
 ```
-User Query -> Query Expansion -> Hybrid Search (Dense + Sparse + RRF)
-           -> Reranker -> Grade Documents -> Generate -> Self-RAG Checks
+
+For the full Wikipedia, set max to 0 (unlimited):
+
+```bash
+python -m data_pipeline.ingest --max 0
 ```
 
-**How it works:** Embed the query, search the entire Qdrant collection,
-fuse results with Reciprocal Rank Fusion, rerank with a cross-encoder, grade
-relevance, and generate.
-
-**Why it fails at scale:** With millions of chunks, even hybrid search
-(dense + sparse) returns too many loosely related results. The reranker helps,
-but it is working with candidates that are already contaminated by cross-article
-noise. The document grading step then makes N serial LLM calls (one per
-document), adding massive latency. If grading marks everything as irrelevant,
-the pipeline falls back to web search or loops.
-
-**Verdict:** Works well for small corpora (a few hundred articles). Breaks down
-at Wikipedia scale.
+Processing the full 6.8M articles takes significant time and disk space
+(approximately 50-100 GB of Qdrant storage for all embeddings). For development
+and demonstration purposes, 1,000-10,000 articles covers a broad enough set of
+topics to answer most common factual questions.
 
 ---
 
-### Option B: Tavily-Only (No RAG Pipeline)
+## How a Query Flows Through the System
 
-```
-User Query -> Tavily Web Search -> LLM generates answer from snippets
-```
+When a user types a question into the Streamlit UI, here is the exact sequence
+of operations, step by step:
 
-**How it works:** Send the query directly to Tavily (or any search API),
-receive web search snippets, pass them to an LLM, and generate an answer.
-Tavily can scope results to `en.wikipedia.org` and even return raw page
-content.
+### 1. Cache Check (L1 + L2)
 
-**Why this is tempting:** It works. For most factual questions, web search
-engines are already excellent at identifying the right Wikipedia article. The
-returned snippets contain enough context for an LLM to answer. This approach
-can be implemented in about 20 lines of code.
+Before any computation, the system checks its dual-layer cache:
 
-**Why it is insufficient for a production system:**
+- **L1 (Exact Match)**: Is this exact query string already cached in Redis?
+  If yes, return the cached answer immediately. Latency: ~1ms.
 
-| Concern | Tavily-Only Limitation |
-|---------|----------------------|
-| **Cost at scale** | Every query costs an API call (~$0.01/search, 1,000 free/month). A production system serving thousands of users would incur significant costs just for retrieval. |
-| **Latency for repeated queries** | Every query requires a network round-trip to Tavily, even if the same question was asked 5 minutes ago. No caching layer. |
-| **Offline operation** | Impossible. If Tavily is down or rate-limited, the entire system fails. |
-| **Snippet depth** | Tavily returns ~500-character snippets per result. For complex, multi-hop questions that require synthesizing information from multiple sections of an article, snippets are often insufficient. |
-| **Control** | You have no control over how content is chunked, what metadata is attached, or how freshness is managed. You get whatever Tavily returns. |
-| **Observability** | No trace of what was retrieved, how it was ranked, or why a particular answer was generated. |
-| **Safety** | No guardrails layer. The LLM can hallucinate or generate unsafe content without any structural checks. |
-| **Engineering depth** | There is no retrieval engineering to demonstrate. The entire "pipeline" is a single API call. |
+- **L2 (Semantic Similarity)**: Is there a semantically similar query already
+  cached? The query is embedded and compared against cached query embeddings
+  using cosine similarity. If similarity exceeds 0.92, the cached answer is
+  returned. This means "What is Tokyo's population?" hits the cache for
+  "Population of Tokyo?" even though the strings are different.
 
-**Verdict:** Works for prototypes and simple Q&A. Lacks the depth, control,
-and cost efficiency required for a production-grade or portfolio-quality system.
+If neither cache hits, proceed to the pipeline.
+
+### 2. Query Expansion (Optional)
+
+If the user enabled any expansion strategies in the sidebar, the system
+generates alternative versions of the query to improve retrieval coverage:
+
+- **Multi-Query**: Generates 3 semantically diverse reformulations.
+  "Population of Tokyo" might become "How many people live in Tokyo?",
+  "Tokyo metropolitan area residents", "Japan capital city population count".
+
+- **HyDE (Hypothetical Document Embeddings)**: Generates a hypothetical answer
+  paragraph and uses its embedding for search. The LLM writes something like
+  "The population of Tokyo is approximately 14 million as of the latest census"
+  and this fake-but-plausible text is used as the search query.
+
+- **Step-Back Abstraction**: Generates a broader question.
+  "What year did Einstein publish the theory of relativity?" becomes
+  "What were Einstein's major scientific contributions?".
+
+- **Decomposition**: Breaks multi-part questions into sub-questions.
+  "Compare the populations of Tokyo and New York" becomes
+  "What is the population of Tokyo?" + "What is the population of New York?".
+
+### 3. Article Discovery (Stage 1)
+
+The expanded queries are searched against the `wikimind_articles` collection.
+This collection contains one dense embedding per article (title + first
+paragraphs). The search returns the top 3 most relevant article titles.
+
+For "What is the population of Tokyo?", Stage 1 might return:
+- Tokyo
+- Demographics of Japan
+- Greater Tokyo Area
+
+This narrows millions of chunks down to a few hundred (the chunks belonging to
+these 3 articles).
+
+### 4. Knowledge Graph Traversal (Optional)
+
+If the `knowledge_graph` strategy is enabled, the system also:
+
+1. Runs spaCy NER on the query to extract entities ("Tokyo").
+2. Looks up "Tokyo" in the co-occurrence knowledge graph stored in Redis.
+3. Traverses up to 2 hops to find related entities and their source articles.
+4. Merges any newly discovered article titles into the target list.
+
+This helps with multi-hop questions. "Who was the first emperor of the dynasty
+that built the Great Wall?" would discover the "Great Wall of China" article,
+traverse to "Qin dynasty", and then to "Qin Shi Huang".
+
+### 5. Article-Scoped Hybrid Search (Stage 2)
+
+Now the system searches the `wikimind_hybrid` collection, but ONLY within the
+chunks belonging to the identified articles. This is done using Qdrant's
+payload filter on the `title` field.
+
+The search runs two parallel tracks:
+
+- **Dense search**: Computes cosine similarity between the query embedding and
+  all chunk embeddings within the target articles.
+- **Sparse search**: Computes BM25 keyword match scores for the same chunks.
+
+Both result sets are fused using **Reciprocal Rank Fusion (RRF)**, which
+combines rankings without needing to normalize scores across different metrics.
+If a chunk ranks #1 in dense search and #3 in sparse search, RRF assigns it a
+combined score that reflects both signals.
+
+### 6. Cross-Encoder Reranking
+
+The top RRF candidates (typically 20) are passed through a FlashRank
+cross-encoder reranker. Unlike the embedding models which encode query and
+document separately, the cross-encoder processes the query and document together
+as a single input, producing a much more accurate relevance score.
+
+The top 5 chunks after reranking become the generation context.
+
+### 7. Document Grading
+
+A single batched LLM call evaluates all 5 chunks at once, asking: "Which of
+these documents are relevant to the query?" The LLM returns a comma-separated
+list of relevant document indices (e.g., "1,3,5"). This replaces the old design
+of making 5 separate LLM calls, reducing latency by ~80%.
+
+If no documents pass grading, the pipeline falls back to generating from
+whatever web snippets are available or returns a "no relevant information found"
+response.
+
+### 8. LLM Generation with Guardrails
+
+The relevant chunks are formatted into a context block and passed to the LLM
+with a generation prompt. NeMo Guardrails wraps this call to enforce:
+
+- Input safety rails (block harmful/adversarial queries).
+- Output safety rails (block toxic or personally identifiable content).
+- Topic rails (keep responses grounded in the retrieved context).
+
+### 9. Hallucination Check
+
+After generation, a separate LLM call checks: "Is this answer supported by the
+retrieved documents, or did the model make up facts?" If the answer is flagged
+as hallucinated, the system retries generation with the same context (up to 2
+retries). Each retry uses a different temperature to encourage a different
+phrasing.
+
+### 10. Answer Quality Check
+
+If the answer passes the hallucination check, another LLM call evaluates:
+"Does this answer actually address the user's question?" If the answer is
+deemed off-topic or incomplete, the system loops all the way back to Step 2
+(query expansion) and tries a different expansion strategy (up to 2 retries).
+
+### 11. Cache and Return
+
+Once the answer passes both checks, it is stored in the Redis cache (both L1
+and L2) and returned to the user via SSE (Server-Sent Events) streaming. The
+Streamlit UI displays the answer along with the retrieved source documents and
+execution metadata.
 
 ---
 
-### Option C: Search-Scoped Hybrid RAG (Chosen Architecture)
+## Detailed Component Breakdown
+
+### LangGraph State Machine
+
+The entire query flow is implemented as a LangGraph state machine with 10 nodes
+and conditional edges. The state dictionary carries all intermediate results
+between nodes:
 
 ```
-User Query -> Query Expansion -> Tavily (scoped to en.wikipedia.org)
-           -> Identify 2-3 relevant article titles
-           -> Scoped Hybrid Search (Qdrant, filtered to those articles only)
-           -> Reranker -> Batched Document Grading -> Generate
-           -> Hallucination Check -> Answer Quality Check -> Return
+State = {
+    query:                The original user question
+    expanded_queries:     List of reformulated queries
+    target_articles:      Article titles from Stage 1
+    documents:            Retrieved chunks from Stage 2
+    generation:           The LLM's answer text
+    retrieval_grade:      "relevant" or "irrelevant"
+    hallucination_grade:  "grounded" or "hallucinated"
+    answer_grade:         "useful" or "not_useful"
+    steps:                Total node transitions (hard budget: 15)
+    hallucination_retries: Independent counter (max 2)
+    answer_retries:       Independent counter (max 2)
+}
 ```
 
-**How it works:** Use Tavily for what it does best -- identifying which
-Wikipedia articles are relevant to the query. Then use the local Hybrid RAG
-pipeline for what it does best -- precise, chunk-level retrieval within those
-articles using dense embeddings, sparse BM25, and cross-encoder reranking.
+The graph looks like this:
 
-**Why this is the right architecture:**
+```
+expand_query -> identify_articles -> [knowledge_graph?] -> retrieve
+    -> grade_documents
+        -> [irrelevant] -> generate_from_web -> END
+        -> [relevant] -> generate -> check_hallucination
+            -> [hallucinated, retries < 2] -> generate (retry)
+            -> [grounded] -> check_answer_quality
+                -> [not useful, retries < 2] -> expand_query (loop back)
+                -> [useful or budget exhausted] -> END
+```
 
-1. **Tavily solves the scoping problem.** A single, cheap API call identifies
-   that "What is the population of Tokyo?" should look at the "Tokyo" article.
-   This eliminates cross-article noise at the source.
+### Dual-Layer Semantic Cache
 
-2. **Qdrant solves the extraction problem.** Once scoped to the right article,
-   the hybrid search (dense + sparse + RRF) finds the exact chunks that contain
-   the answer. The cross-encoder reranker then picks the top 5 most relevant
-   chunks. This level of precision is impossible with web search snippets alone.
+The cache has two tiers stored in Redis:
 
-3. **The two systems are complementary, not redundant:**
-   - Tavily tells you *where* to look (article-level discovery).
-   - The RAG pipeline extracts *exactly what* to answer with (chunk-level retrieval).
+- **L1**: Hash-based exact match. O(1) lookup. Catches repeated identical
+  queries.
+- **L2**: Vector similarity search. The query embedding is compared against
+  a RedisVL vector index of previously cached query embeddings. Catches
+  semantically equivalent reformulations of the same question.
 
-4. **The full engineering stack is preserved:**
-   - Dual-layer semantic caching (L1 exact-match + L2 vector similarity).
-   - Agentic CRAG/Self-RAG loops with hallucination and answer quality checks.
-   - NeMo Guardrails for input/output safety.
-   - Langfuse observability for full trace instrumentation.
-   - Cross-encoder reranking for precision.
-   - Reciprocal Rank Fusion for combining dense and sparse retrieval signals.
+Cache entries include a TTL (time-to-live) that distinguishes between static
+facts (24-hour TTL) and dynamic facts (1-hour TTL based on the freshness of
+the underlying article).
 
-**Verdict:** Combines the strengths of web search (article discovery) with the
-strengths of local RAG (precise extraction, caching, safety, observability).
-This is the architecture that balances production readiness with engineering
-depth.
+### Self-Healing Knowledge Base
+
+Three components keep the data fresh:
+
+1. **Wiki Updater** (`data_pipeline/wiki_updater.py`): Connects to Wikimedia
+   EventStreams, a live SSE feed of every edit to every Wikipedia article in
+   real-time. When an article is edited, the updater fetches the new text,
+   re-chunks, re-embeds, and upserts to Qdrant with version tracking.
+
+2. **State Reconciler** (`data_pipeline/reconciler.py`): Runs on a configurable
+   schedule (default: every 6 hours). Samples 100 random articles from Qdrant,
+   fetches their current revision ID from the MediaWiki API, and compares it to
+   the stored `revision_id`. If drift is detected, triggers re-ingestion.
+
+3. **Version-Aware Upserts**: When an article is updated, all existing chunks
+   for that article are marked `is_current=false` before the new chunks are
+   inserted with `is_current=true`. Old versions are preserved, enabling
+   time-travel queries.
 
 ---
 
-## Tradeoff Summary
+## Knowledge Graph Layer
 
-| Capability | Pure RAG | Tavily-Only | Search-Scoped RAG |
-|-----------|----------|-------------|-------------------|
-| Article identification accuracy | Low (noisy at scale) | High | High (uses Tavily) |
-| Chunk-level precision | High (if right article) | Low (snippets only) | High (scoped search) |
-| Latency (first query) | Medium | Medium | Medium |
-| Latency (repeated query) | Low (cached) | Medium (no cache) | Low (cached) |
-| Cost at scale | Low (local retrieval) | High (per-query API) | Low (1 Tavily call + local retrieval) |
-| Offline capability | Full | None | Partial (fallback to unscoped RAG) |
-| Observability | Full (Langfuse) | None | Full (Langfuse) |
-| Safety guardrails | Full (NeMo) | None | Full (NeMo) |
-| Engineering portfolio value | High | Low | High |
+The knowledge graph adds an entity-relationship dimension to retrieval. Here is
+how it works:
+
+### Building the Graph
+
+1. During ingestion, every chunk is processed with spaCy NER to extract named
+   entities (PERSON, ORG, GPE, LOC, EVENT, WORK_OF_ART).
+
+2. The graph builder script scrolls through all chunks and creates a NetworkX
+   directed graph where:
+   - Each **node** is a unique entity (e.g., "Albert Einstein", "Germany").
+   - Each **edge** connects two entities that co-occur in the same chunk, with
+     metadata recording the source article title and chunk index.
+   - Edge **weights** increase when two entities co-occur in multiple chunks.
+
+3. The graph is serialized to JSON and stored in Redis for fast access.
+
+### Using the Graph at Query Time
+
+When a user asks a multi-hop question like "What university did the inventor
+of the telephone attend?":
+
+1. spaCy extracts "telephone" from the query.
+2. The graph is searched for nodes matching "telephone".
+3. BFS traversal (up to 2 hops) discovers connected entities like
+   "Alexander Graham Bell" and source articles like "Invention of the
+   telephone" and "Alexander Graham Bell".
+4. These article titles are merged with the Stage 1 results, broadening the
+   retrieval scope to include articles the vector search alone might miss.
+
+---
+
+## Temporal Versioning and Time-Travel
+
+Every chunk in Qdrant stores three versioning fields:
+
+- `revision_id`: The Wikipedia revision ID at the time of ingestion.
+- `ingested_at`: The UTC timestamp when the chunk was embedded and stored.
+- `is_current`: Boolean flag indicating whether this is the latest version.
+
+### Default Behavior
+
+Normal queries automatically filter to `is_current=true`, so you always get
+the latest version of every article.
+
+### Time-Travel Mode
+
+When the user enables Time-Travel in the sidebar and selects a date, the query
+filter switches from `is_current=true` to `ingested_at <= selected_date`. This
+retrieves the version of the article as it existed on that date.
+
+Use case: "What did the Wikipedia article about COVID-19 say in March 2020?"
+
+---
+
+## Evaluation Harness
+
+The evaluation system benchmarks the pipeline against standardized Q&A datasets.
+
+### Datasets
+
+- **Natural Questions (NQ)**: Real Google search queries with short answers
+  extracted from Wikipedia by human annotators.
+- **TriviaQA**: Trivia questions with evidence documents.
+
+Both are loaded from HuggingFace with local disk caching.
+
+### Metrics
+
+For each query, the harness measures:
+
+- **Recall@K**: Did any of the top-K retrieved chunks contain the gold answer?
+  Uses normalized substring matching (lowercase, strip articles, remove
+  punctuation).
+- **MRR (Mean Reciprocal Rank)**: At what position was the first relevant chunk?
+  1/rank of the first chunk containing the answer.
+- **Answer Accuracy**: Does the LLM's generated answer contain the gold answer?
+  Normalized substring match.
+- **Latency Percentiles**: P50, P95, P99 of end-to-end query time.
+- **Step Count**: How many LangGraph state transitions did the query require?
+
+### Running an Evaluation
+
+```bash
+# Baseline (no expansion strategies)
+python -m evaluation.harness --dataset nq --subset 50
+
+# With multi-query + step-back expansion
+python -m evaluation.harness --dataset triviaqa --subset 100 \
+    --config evaluation/configs/with_expansion.json
+```
+
+Results are saved as both a markdown report and a JSON dump in
+`evaluation/results/`.
+
+---
+
+## Architecture Diagrams
+
+### End-to-End Pipeline
+
+```
++==============================================================+
+|                      DATA PIPELINE                            |
+|                                                               |
+|  HuggingFace Wikipedia  ---stream--->  Batch Ingestor         |
+|  (6.8M articles)                       |                      |
+|                                        +-> Chunk (512 chars)  |
+|                                        +-> Dense Embed (384d) |
+|                                        +-> Sparse Embed (BM25)|
+|                                        +-> Entity Extract     |
+|                                        +-> Upsert to Qdrant   |
+|                                        +-> Article-level Index|
+|                                                               |
+|  Wikimedia EventStreams ---live SSE--> Wiki Updater            |
+|  (real-time edits)                    +-> Version-aware upsert|
+|                                       +-> Archive old chunks  |
+|                                                               |
+|  State Reconciler ---periodic--> Compare stored vs live revid |
+|                                  +-> Re-ingest stale articles |
++==============================================================+
+
++==============================================================+
+|                     QUERY PIPELINE                            |
+|                                                               |
+|  User Query                                                   |
+|       |                                                       |
+|       v                                                       |
+|  [L1/L2 Cache Check] ---hit---> Return cached answer          |
+|       |                                                       |
+|       v (miss)                                                |
+|  [Query Expansion] (optional: Multi-Query/HyDE/StepBack)     |
+|       |                                                       |
+|       v                                                       |
+|  [Stage 1: Article Discovery]                                 |
+|  Search wikimind_articles -> top 3 article titles             |
+|       |                                                       |
+|       v (optional)                                            |
+|  [Knowledge Graph Traversal]                                  |
+|  Extract entities -> BFS 2-hop -> merge article titles        |
+|       |                                                       |
+|       v                                                       |
+|  [Stage 2: Article-Scoped Hybrid Search]                      |
+|  Dense + Sparse + RRF (filtered to target articles)           |
+|       |                                                       |
+|       v                                                       |
+|  [Cross-Encoder Reranking] -> top 5 chunks                    |
+|       |                                                       |
+|       v                                                       |
+|  [Batched Document Grading] (1 LLM call for all 5)            |
+|       |                                                       |
+|       v                                                       |
+|  [LLM Generation + NeMo Guardrails]                           |
+|       |                                                       |
+|       v                                                       |
+|  [Hallucination Check] ---fail (max 2)--> retry generation    |
+|       |                                                       |
+|       v (pass)                                                |
+|  [Answer Quality Check] ---fail (max 2)--> loop to expansion  |
+|       |                                                       |
+|       v (pass)                                                |
+|  [Cache Store + Return Answer via SSE]                        |
++==============================================================+
+```
+
+### LangGraph State Machine Nodes
+
+```
++----------------+     +--------------------+     +---------------+
+| expand_query   |---->| identify_articles  |---->| graph_search  |
++----------------+     +--------------------+     | (conditional) |
+       ^                                          +-------+-------+
+       |                                                  |
+       |                                          +-------v-------+
+       |                                          |   retrieve    |
+       |                                          +-------+-------+
+       |                                                  |
+       |                                          +-------v-------+
+       |                                          | grade_docs    |
+       |                                          +---+-------+---+
+       |                                              |       |
+       |                                     irrelevant     relevant
+       |                                              |       |
+       |                                    +---------v-+  +--v----------+
+       |                                    | gen_web   |  |  generate   |
+       |                                    +-----+-----+  +--+----------+
+       |                                          |           |
+       |                                         END   +------v------+
+       |                                               | check_hall  |
+       |                                               +--+------+--+
+       |                                                  |      |
+       |                                           hallucinated  grounded
+       |                                                  |      |
+       |                                            (retry, <=2) |
+       |                                                  |      |
+       |                                          +-------v------v--+
+       |                                          | check_answer    |
+       |                                          +--+----------+---+
+       |                                             |          |
+       |                                        not_useful    useful
+       |                                             |          |
+       +---------(loop back, retries <= 2)-----------+         END
+```
 
 ---
 
 ## Key Technical Decisions
 
-### Why Tavily and not the Wikipedia API directly?
+### Why Two-Stage Retrieval Instead of Full-Corpus Search?
 
-The MediaWiki API can search Wikipedia by title, but its full-text search is
-primitive compared to modern search engines. Tavily leverages Google-grade
-search relevance to identify articles, handles disambiguation automatically
-(e.g., "Python" returns the programming language, not the snake, based on
-query context), and returns structured results with relevance scores.
+With millions of chunks, a single vector search returns cross-article noise.
+Stage 1 narrows the scope to 2-3 articles using a lightweight article-level
+index. Stage 2 then performs precise hybrid search within only those articles.
+This reduces noise dramatically and keeps the reranker working with high-quality
+candidates.
 
-### Why not just use Tavily's raw content as the generation context?
+The original design used Tavily (a web search API) for Stage 1. This was
+replaced with a fully local article index (`wikimind_articles` Qdrant
+collection) to eliminate the external dependency, enable offline operation,
+and remove per-query API costs.
 
-Tavily can return raw page content with `include_raw_content=True`, but a
-full Wikipedia article can be 50,000+ tokens. Passing the entire article to
-an LLM is wasteful and exceeds most context windows. The RAG pipeline's
-chunking, hybrid search, and reranking extract only the 5 most relevant
-~512-token chunks, keeping the context focused and the generation grounded.
+### Why Dense + Sparse Instead of Dense Only?
 
-### Why keep the CRAG/Self-RAG agentic loops?
+Dense embeddings capture semantic meaning but miss exact keyword matches.
+Sparse (BM25) embeddings capture exact keywords but miss semantic similarity.
+Combining both with Reciprocal Rank Fusion gives the best of both worlds:
+a chunk that is both semantically relevant AND contains the exact keywords
+scores highest.
 
-Even with scoped retrieval, the LLM can still hallucinate or produce answers
-that do not address the question. The hallucination check verifies that the
-generation is grounded in the retrieved chunks. The answer quality check
-verifies that it actually answers the user's question. These loops provide a
-measurable quality guarantee that a single-pass generation cannot.
+### Why Cross-Encoder Reranking?
 
-### Why split retry counters instead of using a shared counter?
+Bi-encoder embeddings (like the dense embeddings) encode query and document
+independently. This is fast but loses fine-grained interaction between query
+and document tokens. A cross-encoder processes them jointly, attending to
+every word in both, producing much more accurate relevance scores at the cost
+of higher latency. We apply it only to the top 20 candidates (already filtered
+by RRF) to keep latency acceptable.
 
-The original design used a single `retry_count` field incremented by both
-the hallucination checker and the answer quality checker. This caused
-cross-contamination: a hallucination retry consumed budget that the answer
-quality checker needed, and vice versa. Splitting into `hallucination_retries`
-and `answer_retries` ensures each check type has its own independent budget.
+### Why Batched Document Grading?
+
+The original design made one LLM call per document to check relevance. With 5
+documents, that was 5 serial LLM calls adding ~3 seconds of latency. The
+batched approach concatenates all documents with numbered indices and asks the
+LLM to return a comma-separated list of relevant document numbers in a single
+call. Same quality, ~80% less latency.
+
+### Why Separate Retry Counters?
+
+The hallucination check and answer quality check serve different purposes. A
+hallucination retry regenerates from the same context (the answer was factually
+wrong). An answer quality retry re-expands and re-retrieves (the answer was
+factually correct but did not address the question). Using a shared counter
+caused one check type to consume the other's retry budget.
+
+### Why Store is_current Instead of Deleting Old Chunks?
+
+Deleting old chunks is irreversible. By marking them `is_current=false`, we
+preserve the full history and enable time-travel queries. The `is_current`
+payload index ensures that default queries still only hit the latest version
+with no performance penalty.
 
 ---
 
-## Architecture Diagram
+## Running WikiMind Fully Local
 
+WikiMind runs entirely on your local machine. No cloud LLM embedding APIs are
+needed for retrieval -- FastEmbed generates all embeddings locally on CPU.
+
+The only external API requirement is an LLM for the generation, grading, and
+expansion steps. This uses the OpenAI-compatible API configured via the
+`OPENROUTER_API_KEY` environment variable.
+
+### Ingestion Commands
+
+```bash
+# Ingest 1,000 articles (fast, for development)
+python -m data_pipeline.ingest --max 1000
+
+# Ingest 10,000 articles (broader coverage, ~30 min)
+python -m data_pipeline.ingest --max 10000
+
+# Ingest ALL of Wikipedia (6.8M articles, takes hours, ~50-100GB storage)
+python -m data_pipeline.ingest --max 0
+
+# Rebuild only the article-level index (no chunk re-embedding)
+python -m data_pipeline.ingest --articles-only
+
+# Build the knowledge graph from existing chunks
+python -m data_pipeline.graph_builder
 ```
-                    +------------------+
-                    |   User Query     |
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    | Query Expansion  |
-                    | (Multi-Query,    |
-                    |  HyDE, StepBack) |
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    | Tavily Search    |
-                    | (scoped to       |
-                    |  en.wikipedia)   |
-                    +--------+---------+
-                             |
-                    Identified Article Titles
-                             |
-                    +--------v---------+
-                    | Qdrant Hybrid    |
-                    | Search (filtered |
-                    | by article title)|
-                    +----+--------+----+
-                         |        |
-                    Dense+BM25  RRF Fusion
-                         |        |
-                    +----v--------v----+
-                    | FlashRank        |
-                    | Cross-Encoder    |
-                    | Reranker         |
-                    +--------+---------+
-                             |
-                    Top 5 Relevant Chunks
-                             |
-                    +--------v---------+
-                    | Batched Document |
-                    | Grading (1 call) |
-                    +--------+---------+
-                             |
-                    +--------v---------+
-                    | NeMo Guardrails  |
-                    | + LLM Generation |
-                    +--------+---------+
-                             |
-              +--------------+--------------+
-              |                             |
-     +--------v---------+         +--------v---------+
-     | Hallucination    |         | Answer Quality   |
-     | Check            |         | Check            |
-     | (retries <= 2)   |         | (retries <= 2)   |
-     +--------+---------+         +--------+---------+
-              |                             |
-              +-------------+---------------+
-                            |
-                   +--------v---------+
-                   | L1/L2 Cache      |
-                   | Store + Return   |
-                   +------------------+
+
+### Infrastructure
+
+All infrastructure runs in Docker:
+
+```bash
+make dev   # Starts Qdrant, Redis, Prometheus, Grafana, Backend, Frontend
+```
+
+Or individually:
+
+```bash
+docker compose up qdrant redis -d       # Just the databases
+uvicorn backend.main:app --reload       # Backend
+streamlit run frontend/app.py           # Frontend
 ```
