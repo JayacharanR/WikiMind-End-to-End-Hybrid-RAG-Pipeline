@@ -207,6 +207,7 @@ async def chat_endpoint(request: ChatRequest):
             "active_strategies": request.strategies,
             "hallucination_retries": 0,
             "answer_retries": 0,
+            "as_of_date": request.as_of_date,
         }
         
         # Setup Langfuse callbacks

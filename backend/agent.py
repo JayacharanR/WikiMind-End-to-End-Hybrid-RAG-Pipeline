@@ -45,6 +45,7 @@ class AgentState(TypedDict):
     active_strategies: QueryStrategies
     hallucination_retries: int
     answer_retries: int
+    as_of_date: str
 
 
 # ---------------------------------------------------------------------------
@@ -178,6 +179,7 @@ async def node_retrieve(state: AgentState) -> Dict:
         docs, _ = await hybrid_search(
             q,
             article_titles=target_articles if target_articles else None,
+            as_of_date=state.get("as_of_date")
         )
         for doc in docs:
             if doc["id"] not in seen_ids:
