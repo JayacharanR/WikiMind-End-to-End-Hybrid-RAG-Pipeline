@@ -137,11 +137,13 @@ async def safe_generate(query: str, context: str = "") -> str:
         logger.error("Guardrails not available. Cannot generate safely.")
         return "Error: Safety guardrails are not initialized."
 
-    # Append strict anti-tool-call instruction to the query for the local Llama model
+    # Append strict formatting and anti-tool-call instruction to the query for the local Llama model
     strict_query = (
         f"{query}\n\n"
-        "IMPORTANT: Do not output JSON. Do not output tool calls. Answer the question directly in plain text using the context. "
-        "Always list the URLs of the Wikipedia articles you used as References at the very end of your answer."
+        "IMPORTANT INSTRUCTIONS:\n"
+        "1. Do not output JSON or tool calls. Answer directly in plain text using the context.\n"
+        "2. FORMATTING: If the answer is short, keep it to 1-2 lines. If the answer requires detail, ALWAYS start with a 1-2 sentence summary (gist), followed by a blank line, and then the detailed explanation.\n"
+        "3. NEVER write a single massive paragraph. Break long answers into multiple short paragraphs or use bullet points for readability."
     )
 
     messages = [

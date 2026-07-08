@@ -33,38 +33,47 @@
                 <i data-feather="edit-3"></i> New chat
             </a>
             
-            <div class="dropdown-container">
-                <a href="#" class="nav-item" id="settingsBtn">
-                    <i data-feather="settings"></i> Query Transformation
-                    <i data-feather="chevron-down" class="dropdown-arrow" id="dropdownArrow"></i>
-                </a>
-                <div class="dropdown-content" id="settingsDropdown">
-                    <div class="setting-item">
-                        <label>Multi-Query</label>
-                        <input type="checkbox" id="toggleMultiQuery">
-                    </div>
-                    <div class="setting-item">
-                        <label>HyDE</label>
-                        <input type="checkbox" id="toggleHyde">
-                    </div>
-                    <div class="setting-item">
-                        <label>Step-Back</label>
-                        <input type="checkbox" id="toggleStepBack">
-                    </div>
-                    <div class="setting-item">
-                        <label>Decomposition</label>
-                        <input type="checkbox" id="toggleDecomposition">
-                    </div>
-                    <div class="setting-item">
-                        <label>Time-Travel</label>
-                        <input type="checkbox" id="toggleTimeTravel">
-                    </div>
-                    <div class="setting-item" id="datePickerContainer" style="display: none; margin-top: 5px;">
-                        <input type="date" id="asOfDate" style="width: 100%;">
-                    </div>
+            <div style="font-size: 0.75rem; color: #555; text-transform: uppercase; margin-top: 2rem; margin-bottom: 0.25rem; padding-left: 0.5rem; letter-spacing: 0.05em; font-weight: 600;">Coming Soon</div>
+            <a href="#" class="nav-item" style="opacity: 0.5; cursor: default;" onclick="return false;">
+                <i data-feather="activity"></i> Observability
+            </a>
+            <a href="#" class="nav-item" style="opacity: 0.5; cursor: default;" onclick="return false;">
+                <i data-feather="shield"></i> Guardrails
+            </a>
+        </nav>
+        
+        <div class="dropdown-container" style="margin-top: auto;">
+            <a href="#" class="nav-item" id="settingsBtn">
+                <i data-feather="settings"></i> Query Transformation
+                <i data-feather="chevron-down" class="dropdown-arrow" id="dropdownArrow"></i>
+            </a>
+            <div class="dropdown-content" id="settingsDropdown">
+                <div class="setting-item">
+                    <label>Multi-Query</label>
+                    <input type="checkbox" id="toggleMultiQuery">
+                </div>
+                <div class="setting-item">
+                    <label>HyDE</label>
+                    <input type="checkbox" id="toggleHyde">
+                </div>
+                <div class="setting-item">
+                    <label>Step-Back</label>
+                    <input type="checkbox" id="toggleStepBack">
+                </div>
+                <div class="setting-item">
+                    <label>Decomposition</label>
+                    <input type="checkbox" id="toggleDecomposition">
+                </div>
+                <div class="setting-item">
+                    <label>Time-Travel</label>
+                    <input type="checkbox" id="toggleTimeTravel">
+                </div>
+                <div class="setting-item" id="datePickerContainer" style="display: none;">
+                    <label>As of Date</label>
+                    <input type="date" id="asOfDate" style="background:#222; color:#fff; border:none; padding:4px; border-radius:4px;">
                 </div>
             </div>
-        </nav>
+        </div>
     </aside>
 
     <!-- Main Chat Area -->
@@ -80,7 +89,7 @@
         </div>
 
         <!-- Input Area -->
-        <div class="input-container">
+        <div class="input-container centered" id="inputContainer">
             <div class="input-box">
                 <button class="home-btn input-home" onclick="location.reload()" title="New Chat">W</button>
                 <textarea id="chatInput" placeholder="Type a message..." rows="1"></textarea>
@@ -96,7 +105,7 @@
 
 
     <!-- Load custom logic -->
-    <script src="script.js"></script>
+    <script src="script.js?v=9"></script>
     <script>
         // Initialize feather icons
         feather.replace();

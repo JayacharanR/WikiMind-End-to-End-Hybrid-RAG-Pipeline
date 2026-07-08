@@ -1,5 +1,8 @@
 const API_URL = "http://localhost:8000";
 
+let isGenerating = false;
+let currentAbortController = null;
+
 // DOM Elements
 const chatHistory = document.getElementById('chatHistory');
 const emptyState = document.getElementById('emptyState');
@@ -35,10 +38,12 @@ const strategies = {
 const sidebar = document.getElementById('sidebar');
 const sidebarToggle = document.getElementById('sidebarToggle');
 const chatContainer = document.querySelector('.chat-container');
+const topNav = document.querySelector('.top-nav');
 
 sidebarToggle.addEventListener('click', () => {
     sidebar.classList.toggle('collapsed');
     chatContainer.classList.toggle('expanded');
+    topNav.classList.toggle('collapsed');
 });
 
 // Update settings state on change
@@ -73,25 +78,50 @@ function updateDate() {
 chatInput.addEventListener('keydown', (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
         e.preventDefault();
+        if (!isGenerating) {
+            sendMessage();
+        }
+    }
+});
+
+sendBtn.addEventListener('click', () => {
+    if (isGenerating && currentAbortController) {
+        currentAbortController.abort();
+    } else if (!isGenerating) {
         sendMessage();
     }
 });
 
-sendBtn.addEventListener('click', sendMessage);
-
 async function sendMessage() {
-    const text = chatInput.value.trim();
-    if (!text) return;
+    if (isGenerating) return;
 
-    // Remove empty state
-    if (emptyState) {
-        emptyState.style.display = 'none';
+    const text = chatInput.value.trim();
+    // Trigger slide down animation
+    const inputContainer = document.getElementById('inputContainer');
+    if (inputContainer && inputContainer.classList.contains('centered')) {
+        inputContainer.classList.remove('centered');
+    }
+
+    // Hide empty state
+    const emptyState = document.getElementById('emptyState');
+    if (emptyState && emptyState.style.display !== 'none') {
+        emptyState.style.opacity = '0';
+        setTimeout(() => {
+            emptyState.style.display = 'none';
+        }, 400); // Wait for fade out
     }
 
     // Add User Message
     appendMessage('user', text);
     chatInput.value = '';
     chatInput.style.height = 'auto'; // reset height
+
+    isGenerating = true;
+    currentAbortController = new AbortController();
+    
+    // Change icon to stop
+    sendBtn.innerHTML = '<i data-feather="square"></i>';
+    if (window.feather) feather.replace();
 
     // Setup Assistant Message placeholder
     const { bubble, contentDiv, metaDiv } = createMessageContainer('assistant');
@@ -110,6 +140,8 @@ async function sendMessage() {
         payload.as_of_date = strategies.as_of_date;
     }
 
+    const startTime = performance.now();
+
     try {
         const response = await fetch(`${API_URL}/chat`, {
             method: 'POST',
@@ -117,7 +149,8 @@ async function sendMessage() {
                 'Content-Type': 'application/json',
                 'Accept': 'text/event-stream'
             },
-            body: JSON.stringify(payload)
+            body: JSON.stringify(payload),
+            signal: currentAbortController.signal
         });
 
         if (!response.ok) {
@@ -125,14 +158,24 @@ async function sendMessage() {
             return;
         }
 
+        const contentType = response.headers.get('content-type');
+        
+        // Handle Cache Hit (JSON Response)
+        if (contentType && contentType.includes('application/json')) {
+            const data = await response.json();
+            renderFinalResponse(data, contentDiv, metaDiv, startTime);
+            return;
+        }
+
+        // Handle Cache Miss (SSE Stream)
         const reader = response.body.getReader();
         const decoder = new TextDecoder("utf-8");
         
-        let fullAnswer = "";
         let isDone = false;
         let currentEvent = null;
 
-        contentDiv.innerHTML = '<em>Agent is working...</em>';
+        contentDiv.innerHTML = '<div class="loading-text"><i data-feather="loader" class="spin-icon"></i> <em>Agent is working...</em></div>';
+        if (window.feather) feather.replace();
 
         while (!isDone) {
             const { value, done } = await reader.read();
@@ -155,33 +198,11 @@ async function sendMessage() {
                         const data = JSON.parse(dataStr);
                         
                         if (currentEvent === "update") {
-                            contentDiv.innerHTML = `<em>Agent is working... [${data.node}]</em>`;
+                            contentDiv.innerHTML = `<div class="loading-text"><i data-feather="loader" class="spin-icon"></i> <em>Agent is working... [${data.node}]</em></div>`;
+                            if (window.feather) feather.replace();
                         } 
                         else if (currentEvent === "final") {
-                            let answer = data.answer || "";
-                            try {
-                                const ansJson = JSON.parse(answer);
-                                if (ansJson.name === "generate_text" && ansJson.parameters) {
-                                    let params = ansJson.parameters;
-                                    if (typeof params === 'string') params = JSON.parse(params);
-                                    answer = params.input || answer;
-                                }
-                            } catch(e) {}
-                            
-                            fullAnswer = answer;
-                            contentDiv.innerHTML = marked.parse(fullAnswer);
-                            
-                            // Render Sources / Metadata if present
-                            let metaHtml = '';
-                            if (data.metadata && data.metadata.total_duration_ms) {
-                                const sec = (data.metadata.total_duration_ms / 1000).toFixed(2);
-                                metaHtml += `<div class="metadata-badge"><i data-feather="clock" style="width:12px;height:12px"></i> ${sec}s</div>`;
-                            }
-                            if (data.sources && data.sources.length > 0) {
-                                metaHtml += `<div class="metadata-badge"><i data-feather="book-open" style="width:12px;height:12px"></i> ${data.sources.length} sources</div>`;
-                            }
-                            metaDiv.innerHTML = metaHtml;
-                            feather.replace(); // render new icons
+                            renderFinalResponse(data, contentDiv, metaDiv, startTime);
                         }
                         else if (currentEvent === "error") {
                             contentDiv.innerHTML = `<span style="color:red">Backend Error: ${data.detail || 'Unknown error'}</span>`;
@@ -195,8 +216,17 @@ async function sendMessage() {
         }
 
     } catch (err) {
-        console.error(err);
-        contentDiv.innerHTML = `<span style="color:red">Failed to connect to backend: ${err.message}</span>`;
+        if (err.name === 'AbortError') {
+            contentDiv.innerHTML = '<em>Query stopped by user.</em>';
+        } else {
+            console.error(err);
+            contentDiv.innerHTML = `<span style="color:red">Failed to connect to backend: ${err.message}</span>`;
+        }
+    } finally {
+        isGenerating = false;
+        currentAbortController = null;
+        sendBtn.innerHTML = '<i data-feather="arrow-up"></i>';
+        if (window.feather) feather.replace();
     }
 }
 
@@ -233,4 +263,87 @@ function createMessageContainer(role) {
 
 function scrollToBottom() {
     chatHistory.scrollTop = chatHistory.scrollHeight;
+}
+
+function renderFinalResponse(data, contentDiv, metaDiv, startTime) {
+    let answer = data.answer || "";
+    try {
+        const ansJson = JSON.parse(answer);
+        if (ansJson.name === "generate_text" && ansJson.parameters) {
+            let params = ansJson.parameters;
+            if (typeof params === 'string') params = JSON.parse(params);
+            answer = params.input || answer;
+        }
+    } catch(e) {}
+    
+    let fullAnswer = answer || "";
+    
+    if (data.metadata && data.metadata.expanded_queries && data.metadata.expanded_queries.length > 0) {
+        fullAnswer += "\n\n---\n\n**Queries Searched:**\n";
+        data.metadata.expanded_queries.forEach(q => {
+            fullAnswer += `- ${q}\n`;
+        });
+    }
+
+    let uniqueUrls = new Set();
+    
+    if (data.sources && data.sources.length > 0) {
+        fullAnswer += "\n\n---\n\n**References:**\n";
+        let refCount = 0;
+        data.sources.forEach(src => {
+            let url = src.url;
+            if (!url && src.title) {
+                url = "https://en.wikipedia.org/wiki/" + encodeURIComponent(src.title.replace(/ /g, '_'));
+            }
+            
+            if (url && !uniqueUrls.has(url)) {
+                uniqueUrls.add(url);
+                if (refCount < 5) { // Limit to maximum 5 articles
+                    fullAnswer += `- [${src.title || url}](${url})\n`;
+                    refCount++;
+                }
+            }
+        });
+    } else {
+        fullAnswer += "\n\n---\n\n**References:**\n- *No relevant Wikipedia articles were found in the local database. The answer above was generated using the model's internal knowledge.*";
+    }
+    
+    contentDiv.innerHTML = marked.parse(fullAnswer);
+    
+    // Render Sources / Metadata if present
+    let metaHtml = '';
+    
+    // Add Timer
+    let durationSec = ((performance.now() - startTime) / 1000).toFixed(2);
+    metaHtml += `<div class="metadata-badge"><i data-feather="clock" style="width:12px;height:12px"></i> ${durationSec}s</div>`;
+    
+    if (uniqueUrls.size > 0) {
+        metaHtml += `<div class="metadata-badge"><i data-feather="book-open" style="width:12px;height:12px"></i> ${uniqueUrls.size} articles</div>`;
+    }
+    
+    // Add Copy Button
+    metaHtml += `<button class="copy-btn metadata-badge" style="background:transparent; border:1px solid #333; color:#A0A0A0; cursor:pointer;" title="Copy to clipboard">
+        <i data-feather="copy" style="width:12px;height:12px"></i> Copy
+    </button>`;
+    
+    metaDiv.innerHTML = metaHtml;
+    
+    // Attach copy event listener
+    const copyBtn = metaDiv.querySelector('.copy-btn');
+    if (copyBtn) {
+        copyBtn.addEventListener('click', () => {
+            navigator.clipboard.writeText(fullAnswer).then(() => {
+                copyBtn.innerHTML = `<i data-feather="check" style="width:12px;height:12px"></i> Copied`;
+                if (window.feather) feather.replace();
+                setTimeout(() => {
+                    copyBtn.innerHTML = `<i data-feather="copy" style="width:12px;height:12px"></i> Copy`;
+                    if (window.feather) feather.replace();
+                }, 2000);
+            });
+        });
+    }
+
+    if (window.feather) {
+        feather.replace();
+    }
 }
