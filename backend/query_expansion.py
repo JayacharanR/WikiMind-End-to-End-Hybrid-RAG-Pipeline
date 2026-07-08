@@ -22,25 +22,35 @@ logger = logging.getLogger(__name__)
 # Prompts
 # ---------------------------------------------------------------------------
 
-MULTI_QUERY_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "You are an AI language model assistant. Your task is to generate 3 different versions of the given user query to retrieve relevant documents from a vector database. By generating multiple perspectives on the user query, your goal is to help the user overcome some of the limitations of distance-based similarity search. Provide these alternative questions separated by newlines. Do not number them."),
-    ("user", "Original query: {query}")
-])
+from langchain_core.prompts import PromptTemplate
 
-HYDE_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "You are an expert Wikipedia author. Write a short, factual, hypothetical Wikipedia paragraph that directly answers the user's query. Do not include any introductory or concluding remarks, just the factual text."),
-    ("user", "Query: {query}")
-])
+MULTI_QUERY_PROMPT = PromptTemplate.from_template(
+    "You are an AI language model assistant. Your task is to generate 3 different versions of the given user query to retrieve relevant documents from a vector database.\n"
+    "Provide these alternative questions separated by newlines. Do not number them. Do not output JSON. Generate the text directly.\n\n"
+    "Original query: {query}\n"
+    "Alternative queries:\n"
+)
 
-STEP_BACK_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "You are an expert at world knowledge. Your task is to step back and paraphrase a question to a more generic step-back question, which is easier to answer. Here are a few examples:\nOriginal: Which team did the person who scored the most points in the NBA finals play for?\nStep-back: Who scored the most points in the NBA finals?\nOriginal: Est_Ovest is located in which country?\nStep-back: What is Est_Ovest?"),
-    ("user", "Original question: {query}\nStep-back question:")
-])
+HYDE_PROMPT = PromptTemplate.from_template(
+    "You are an expert Wikipedia author. Write a short, factual, hypothetical Wikipedia paragraph that directly answers the user's query.\n"
+    "Do not include any introductory remarks. DO NOT output JSON. Do NOT use tools. You must generate the paragraph yourself directly in plain text.\n\n"
+    "Query: {query}\n\n"
+    "Hypothetical Wikipedia Paragraph:\n"
+)
 
-DECOMPOSITION_PROMPT = ChatPromptTemplate.from_messages([
-    ("system", "You are a helpful assistant that breaks down complex questions into simpler, atomic sub-questions. Generate between 2 and 4 sub-questions that, when answered together, would provide a complete answer to the original question. Output one question per line, with no numbering."),
-    ("user", "Complex question: {query}")
-])
+STEP_BACK_PROMPT = PromptTemplate.from_template(
+    "You are an expert at world knowledge. Your task is to step back and paraphrase a question to a more generic step-back question.\n"
+    "Do not output JSON. Generate the text directly.\n\n"
+    "Original question: {query}\n"
+    "Step-back question:\n"
+)
+
+DECOMPOSITION_PROMPT = PromptTemplate.from_template(
+    "Break down the following complex question into 2 to 4 simpler, atomic sub-questions.\n"
+    "Output one question per line, with no numbering. Do not output JSON.\n\n"
+    "Complex question: {query}\n"
+    "Sub-questions:\n"
+)
 
 
 # ---------------------------------------------------------------------------
@@ -122,7 +132,7 @@ async def expand_query(query: str, strategies: QueryStrategies) -> List[str]:
     llm = ChatOpenAI(
         model=settings.openrouter_model,
         api_key=settings.openrouter_api_key,
-        base_url="https://openrouter.ai/api/v1",
+        base_url=settings.llm_base_url,
         temperature=0.2
     )
     

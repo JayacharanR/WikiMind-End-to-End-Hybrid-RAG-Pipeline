@@ -4,10 +4,16 @@ Handles the initialization of the Qdrant vector database, including setting up
 the hybrid collection schema with both dense and sparse (BM25) vector configurations.
 Provides helper methods for ID generation to prevent race conditions during
 parallel ingestion.
+
+Supports two modes:
+- ``local`` (embedded): Stores data on disk via Qdrant's embedded mode.
+  No Docker or external server required. Ideal for development and offline usage.
+- ``remote``: Connects to a running Qdrant server (e.g., via Docker Compose).
 """
 
 import hashlib
 import logging
+import os
 import uuid
 from typing import Optional
 
@@ -26,16 +32,51 @@ _async_client: Optional[AsyncQdrantClient] = None
 _sync_client: Optional[QdrantClient] = None
 
 
-def get_async_qdrant() -> AsyncQdrantClient:
-    """Return a cached async Qdrant client instance."""
-    global _async_client
-    if _async_client is None:
-        settings = get_settings()
-        _async_client = AsyncQdrantClient(
+def _create_sync_client() -> QdrantClient:
+    """Create a Qdrant sync client based on the configured mode."""
+    settings = get_settings()
+
+    if settings.qdrant_mode == "local":
+        path = settings.qdrant_local_path
+        os.makedirs(path, exist_ok=True)
+        logger.info("Using Qdrant in EMBEDDED mode (path: %s)", path)
+        return QdrantClient(path=path, timeout=60.0)
+    else:
+        logger.info("Using Qdrant in REMOTE mode (url: %s)", settings.qdrant_url)
+        return QdrantClient(
+            url=settings.qdrant_url,
+            api_key=settings.qdrant_api_key or None,
+            timeout=30.0,
+        )
+
+
+def _create_async_client() -> AsyncQdrantClient:
+    """Create a Qdrant async client based on the configured mode.
+
+    In local (embedded) mode, we reuse the sync client's underlying storage
+    to avoid the storage folder lock conflict that occurs when two clients
+    try to open the same embedded database simultaneously.
+    """
+    settings = get_settings()
+
+    if settings.qdrant_mode == "local":
+        # In embedded mode, return None — we'll use sync client via asyncio.to_thread
+        logger.info("Async Qdrant: will delegate to sync client in embedded mode")
+        return None
+    else:
+        logger.info("Using async Qdrant in REMOTE mode (url: %s)", settings.qdrant_url)
+        return AsyncQdrantClient(
             url=settings.qdrant_url,
             api_key=settings.qdrant_api_key or None,
             timeout=10.0,
         )
+
+
+def get_async_qdrant() -> AsyncQdrantClient:
+    """Return a cached async Qdrant client instance."""
+    global _async_client
+    if _async_client is None:
+        _async_client = _create_async_client()
     return _async_client
 
 
@@ -43,12 +84,7 @@ def get_sync_qdrant() -> QdrantClient:
     """Return a cached sync Qdrant client instance (useful for batch scripts)."""
     global _sync_client
     if _sync_client is None:
-        settings = get_settings()
-        _sync_client = QdrantClient(
-            url=settings.qdrant_url,
-            api_key=settings.qdrant_api_key or None,
-            timeout=30.0,
-        )
+        _sync_client = _create_sync_client()
     return _sync_client
 
 

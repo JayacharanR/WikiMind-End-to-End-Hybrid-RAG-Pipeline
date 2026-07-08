@@ -21,6 +21,11 @@ explanation.md
 # Environment variables
 .env
 
+# Large local models and binaries
+local_llm/
+venv/
+venv_new/
+
 # Docker volumes and runtime data
 local_qdrant/
 data/

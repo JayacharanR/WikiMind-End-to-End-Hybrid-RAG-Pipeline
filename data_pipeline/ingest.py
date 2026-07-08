@@ -13,6 +13,7 @@ import argparse
 import json
 import logging
 import os
+import sys
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -64,24 +65,52 @@ def get_sparse_model() -> SparseTextEmbedding:
 # Checkpointing
 # ---------------------------------------------------------------------------
 
-def load_checkpoint() -> int:
-    """Load the number of articles processed so far."""
+def load_checkpoint() -> dict:
+    """Load the checkpoint with full session metadata."""
     if os.path.exists(CHECKPOINT_FILE):
         try:
             with open(CHECKPOINT_FILE, "r") as f:
                 data = json.load(f)
-                return data.get("articles_processed", 0)
+                # Backwards compatibility: old checkpoints only had articles_processed
+                if isinstance(data.get("articles_processed"), int) and "total_chunks" not in data:
+                    data["total_chunks"] = 0
+                    data["last_article_title"] = ""
+                    data["sessions"] = []
+                return data
         except Exception as exc:
             logger.warning("Failed to load checkpoint: %s. Starting from 0.", exc)
-    return 0
+    return {
+        "articles_processed": 0,
+        "total_chunks": 0,
+        "last_article_title": "",
+        "sessions": [],
+    }
 
 
-def save_checkpoint(articles_processed: int) -> None:
-    """Save the progress checkpoint."""
+def save_checkpoint(
+    articles_processed: int,
+    total_chunks: int = 0,
+    last_title: str = "",
+    session_info: dict | None = None,
+) -> None:
+    """Save the progress checkpoint with detailed metadata."""
     os.makedirs(os.path.dirname(CHECKPOINT_FILE), exist_ok=True)
     try:
+        # Load existing to preserve session history
+        existing = load_checkpoint()
+        existing["articles_processed"] = articles_processed
+        existing["total_chunks"] = total_chunks
+        existing["last_article_title"] = last_title
+        existing["last_updated"] = datetime.now(timezone.utc).isoformat()
+
+        if session_info:
+            sessions = existing.get("sessions", [])
+            sessions.append(session_info)
+            # Keep last 20 sessions
+            existing["sessions"] = sessions[-20:]
+
         with open(CHECKPOINT_FILE, "w") as f:
-            json.dump({"articles_processed": articles_processed}, f)
+            json.dump(existing, f, indent=2)
     except Exception as exc:
         logger.warning("Failed to save checkpoint: %s", exc)
 
@@ -156,7 +185,7 @@ def process_batch(
     articles: List[Dict[str, Any]],
     articles_only: bool = False,
     skip_ner: bool = False,
-) -> None:
+) -> int:
     """Process a batch of Wikipedia articles.
 
     Chunks the text, embeds it, and upserts to Qdrant. Also generates
@@ -166,15 +195,18 @@ def process_batch(
         articles: List of article dicts from the HuggingFace dataset.
         articles_only: If True, only upsert article-level entries (skip chunks).
         skip_ner: If True, skip spaCy NER entity extraction (faster ingestion).
+
+    Returns:
+        Number of chunks processed in this batch.
     """
     if not articles:
-        return
+        return 0
 
     # Always upsert article-level entries
     _upsert_article_entries(articles)
 
     if articles_only:
-        return
+        return 0
 
     settings = get_settings()
     client = get_sync_qdrant()
@@ -222,7 +254,7 @@ def process_batch(
             })
 
     if not points:
-        return
+        return 0
 
     # 2. Embedding
     texts_to_embed = [p["text"] for p in points]
@@ -276,7 +308,160 @@ def process_batch(
         )
     
     logger.debug("Upserted %d chunks from %d articles.", len(qdrant_points), len(articles))
+    return len(qdrant_points)
 
+
+# ---------------------------------------------------------------------------
+# Live Progress Display
+# ---------------------------------------------------------------------------
+
+def _format_time(seconds: float) -> str:
+    """Format seconds into a human-readable string."""
+    if seconds < 60:
+        return f"{seconds:.0f}s"
+    elif seconds < 3600:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}m {s}s"
+    else:
+        h = int(seconds // 3600)
+        m = int((seconds % 3600) // 60)
+        return f"{h}h {m}m"
+
+
+def _get_dir_size_mb(path: str) -> float:
+    """Get the size of a directory in MB."""
+    total = 0
+    if os.path.exists(path):
+        for dirpath, dirnames, filenames in os.walk(path):
+            for f in filenames:
+                fp = os.path.join(dirpath, f)
+                try:
+                    total += os.path.getsize(fp)
+                except OSError:
+                    pass
+    return total / (1024 * 1024)
+
+
+def _print_progress(
+    articles_done: int,
+    articles_target: int,
+    chunks_done: int,
+    articles_per_sec: float,
+    chunks_per_sec: float,
+    elapsed: float,
+    eta_seconds: float,
+    last_title: str,
+    qdrant_path: str,
+) -> None:
+    """Print a live progress dashboard to the terminal."""
+    # Progress bar
+    if articles_target > 0:
+        pct = min(articles_done / articles_target * 100, 100)
+        bar_width = 40
+        filled = int(bar_width * articles_done / articles_target)
+        bar = "█" * filled + "░" * (bar_width - filled)
+    else:
+        pct = 0
+        bar = "~" * 40
+
+    # Qdrant storage size
+    storage_mb = _get_dir_size_mb(qdrant_path)
+    if storage_mb > 1024:
+        storage_str = f"{storage_mb / 1024:.1f} GB"
+    else:
+        storage_str = f"{storage_mb:.0f} MB"
+
+    # Build output
+    lines = [
+        "",
+        f"  ┌─────────────────────────────────────────────────────┐",
+        f"  │  📚 WikiMind Offline Embedding Progress             │",
+        f"  ├─────────────────────────────────────────────────────┤",
+        f"  │  [{bar}] {pct:5.1f}%  │",
+        f"  │                                                     │",
+        f"  │  Articles:  {articles_done:>8,} / {articles_target:>8,}                │",
+        f"  │  Chunks:    {chunks_done:>8,}                              │",
+        f"  │  Speed:     {articles_per_sec:>6.1f} articles/sec | {chunks_per_sec:>6.0f} chunks/sec │",
+        f"  │  Elapsed:   {_format_time(elapsed):<12s}                         │",
+        f"  │  ETA:       {_format_time(eta_seconds) if eta_seconds > 0 else 'calculating...':<12s}                         │",
+        f"  │  Storage:   {storage_str:<12s}                         │",
+        f"  │                                                     │",
+        f"  │  Last: {last_title[:45]:<45s} │",
+        f"  └─────────────────────────────────────────────────────┘",
+    ]
+
+    # Move cursor up and overwrite
+    output = "\r" + "\n".join(lines)
+    sys.stdout.write(f"\033[{len(lines)}A" + output)
+    sys.stdout.flush()
+
+
+def _print_header(
+    max_articles: int,
+    batch_size: int,
+    skip_ner: bool,
+    checkpoint_articles: int,
+    qdrant_mode: str,
+) -> None:
+    """Print the startup header."""
+    print("\n" + "=" * 57)
+    print("  🧠 WikiMind — Offline Wikipedia Embedding Pipeline")
+    print("=" * 57)
+    print(f"  Target articles:   {max_articles if max_articles > 0 else 'unlimited':>10}")
+    print(f"  Batch size:        {batch_size:>10}")
+    print(f"  NER extraction:    {'enabled' if not skip_ner else 'disabled':>10}")
+    print(f"  Qdrant mode:       {qdrant_mode:>10}")
+    print(f"  Resuming from:     {checkpoint_articles:>10} articles")
+    if checkpoint_articles > 0:
+        print(f"  ✅ Found checkpoint — will skip first {checkpoint_articles} articles")
+    print("=" * 57)
+    print()
+    # Print blank lines that the progress display will overwrite
+    for _ in range(16):
+        print()
+
+
+def _print_final_report(
+    articles_this_session: int,
+    chunks_this_session: int,
+    total_articles: int,
+    elapsed: float,
+    qdrant_path: str,
+    interrupted: bool = False,
+) -> None:
+    """Print the final summary report."""
+    storage_mb = _get_dir_size_mb(qdrant_path)
+    if storage_mb > 1024:
+        storage_str = f"{storage_mb / 1024:.1f} GB"
+    else:
+        storage_str = f"{storage_mb:.0f} MB"
+
+    rate = articles_this_session / elapsed if elapsed > 0 else 0
+
+    print("\n\n")
+    print("=" * 57)
+    if interrupted:
+        print("  ⚠️  Ingestion PAUSED (checkpoint saved)")
+    else:
+        print("  ✅  Ingestion COMPLETE")
+    print("=" * 57)
+    print(f"  Articles this session:  {articles_this_session:>10,}")
+    print(f"  Chunks this session:    {chunks_this_session:>10,}")
+    print(f"  Total articles (all):   {total_articles:>10,}")
+    print(f"  Avg speed:              {rate:>10.1f} articles/sec")
+    print(f"  Elapsed time:           {_format_time(elapsed):>10}")
+    print(f"  Qdrant storage:         {storage_str:>10}")
+    print(f"  Checkpoint:             {CHECKPOINT_FILE}")
+    print("=" * 57)
+    if interrupted:
+        print("\n  To resume, run the same command again.")
+        print("  The script will automatically skip already-processed articles.\n")
+
+
+# ---------------------------------------------------------------------------
+# Main Ingestion Runner
+# ---------------------------------------------------------------------------
 
 def run_ingestion(
     max_articles: int = 1000,
@@ -297,10 +482,24 @@ def run_ingestion(
     """
     from backend.article_index import init_article_collection
 
+    settings = get_settings()
+
     init_collection()
     init_article_collection()
     
-    processed_count = load_checkpoint()
+    checkpoint = load_checkpoint()
+    processed_count = checkpoint.get("articles_processed", 0)
+    total_chunks = checkpoint.get("total_chunks", 0)
+
+    # Print startup header
+    _print_header(
+        max_articles=max_articles,
+        batch_size=batch_size,
+        skip_ner=skip_ner,
+        checkpoint_articles=processed_count,
+        qdrant_mode=settings.qdrant_mode,
+    )
+
     target_label = str(max_articles) if max_articles > 0 else "unlimited"
     logger.info(
         "Starting ingestion. Target: %s articles. Resuming from %d. NER: %s.",
@@ -308,6 +507,7 @@ def run_ingestion(
     )
     
     # Load wikipedia dataset in streaming mode
+    logger.info("Loading Wikipedia dataset from HuggingFace (streaming mode)...")
     dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
     
     # Skip already processed
@@ -318,34 +518,62 @@ def run_ingestion(
     batch = []
     start_time = time.monotonic()
     articles_this_session = 0
+    chunks_this_session = 0
+    last_title = checkpoint.get("last_article_title", "")
     
     try:
         for article in dataset:
             batch.append(article)
             
             if len(batch) >= batch_size:
-                process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
+                batch_chunks = process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
                 processed_count += len(batch)
                 articles_this_session += len(batch)
-                save_checkpoint(processed_count)
+                chunks_this_session += batch_chunks
+                total_chunks += batch_chunks
+                last_title = batch[-1].get("title", "")
+
+                save_checkpoint(
+                    articles_processed=processed_count,
+                    total_chunks=total_chunks,
+                    last_title=last_title,
+                )
                 
                 elapsed = time.monotonic() - start_time
                 rate = articles_this_session / elapsed if elapsed > 0 else 0
+                chunk_rate = chunks_this_session / elapsed if elapsed > 0 else 0
 
                 # ETA calculation
                 if max_articles > 0 and rate > 0:
                     remaining = max_articles - processed_count
                     eta_seconds = remaining / rate
-                    eta_h = int(eta_seconds // 3600)
-                    eta_m = int((eta_seconds % 3600) // 60)
+                else:
+                    eta_seconds = -1
+
+                # Live progress display
+                _print_progress(
+                    articles_done=processed_count,
+                    articles_target=max_articles if max_articles > 0 else processed_count,
+                    chunks_done=total_chunks,
+                    articles_per_sec=rate,
+                    chunks_per_sec=chunk_rate,
+                    elapsed=elapsed,
+                    eta_seconds=eta_seconds,
+                    last_title=last_title,
+                    qdrant_path=settings.qdrant_local_path,
+                )
+
+                # Also log for file logging
+                if max_articles > 0:
                     logger.info(
-                        "[%d/%s] %.1f articles/sec | ETA: %dh %dm",
-                        processed_count, target_label, rate, eta_h, eta_m,
+                        "[%d/%s] %.1f articles/sec | %d chunks | ETA: %s",
+                        processed_count, target_label, rate, total_chunks,
+                        _format_time(eta_seconds) if eta_seconds > 0 else "N/A",
                     )
                 else:
                     logger.info(
-                        "[%d/%s] %.1f articles/sec",
-                        processed_count, target_label, rate,
+                        "[%d/%s] %.1f articles/sec | %d chunks",
+                        processed_count, target_label, rate, total_chunks,
                     )
                 
                 batch = []
@@ -356,21 +584,82 @@ def run_ingestion(
                     
         # Process any remaining
         if batch and (max_articles <= 0 or processed_count < max_articles):
-            process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
+            batch_chunks = process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
             processed_count += len(batch)
-            save_checkpoint(processed_count)
+            articles_this_session += len(batch)
+            chunks_this_session += batch_chunks
+            total_chunks += batch_chunks
+            last_title = batch[-1].get("title", "") if batch else last_title
+
+            save_checkpoint(
+                articles_processed=processed_count,
+                total_chunks=total_chunks,
+                last_title=last_title,
+                session_info={
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "articles": articles_this_session,
+                    "chunks": chunks_this_session,
+                    "duration_sec": round(time.monotonic() - start_time, 1),
+                },
+            )
             logger.info("Processed final batch. Total: %d articles.", processed_count)
             
     except KeyboardInterrupt:
-        logger.info("Ingestion interrupted by user. Saved checkpoint at %d.", processed_count)
+        # Save checkpoint on Ctrl+C
+        save_checkpoint(
+            articles_processed=processed_count,
+            total_chunks=total_chunks,
+            last_title=last_title,
+            session_info={
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+                "articles": articles_this_session,
+                "chunks": chunks_this_session,
+                "duration_sec": round(time.monotonic() - start_time, 1),
+                "interrupted": True,
+            },
+        )
+        elapsed = time.monotonic() - start_time
+        _print_final_report(
+            articles_this_session=articles_this_session,
+            chunks_this_session=chunks_this_session,
+            total_articles=processed_count,
+            elapsed=elapsed,
+            qdrant_path=settings.qdrant_local_path,
+            interrupted=True,
+        )
+        return
+
     except Exception as exc:
+        save_checkpoint(
+            articles_processed=processed_count,
+            total_chunks=total_chunks,
+            last_title=last_title,
+        )
         logger.error("Ingestion failed at article %d: %s", processed_count, exc)
         raise
 
     elapsed = time.monotonic() - start_time
-    logger.info(
-        "Ingestion complete. Processed %d articles in %.0f minutes (%.1f articles/sec).",
-        articles_this_session, elapsed / 60, articles_this_session / elapsed if elapsed > 0 else 0,
+
+    # Save final session info
+    save_checkpoint(
+        articles_processed=processed_count,
+        total_chunks=total_chunks,
+        last_title=last_title,
+        session_info={
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "articles": articles_this_session,
+            "chunks": chunks_this_session,
+            "duration_sec": round(elapsed, 1),
+            "completed": True,
+        },
+    )
+
+    _print_final_report(
+        articles_this_session=articles_this_session,
+        chunks_this_session=chunks_this_session,
+        total_articles=processed_count,
+        elapsed=elapsed,
+        qdrant_path=settings.qdrant_local_path,
     )
 
 

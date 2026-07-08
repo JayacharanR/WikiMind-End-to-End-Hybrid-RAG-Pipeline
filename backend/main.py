@@ -9,7 +9,7 @@ import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
@@ -218,18 +218,20 @@ async def chat_endpoint(request: ChatRequest):
         logger.info("Invoking LangGraph agent pipeline for: %s", query[:60])
         
         try:
+            current_state = dict(initial_state)
             # Stream the state updates from LangGraph
             async for output in agent_app.astream(initial_state, config=config, stream_mode="updates"):
                 # output is a dict keyed by the node name
                 for node_name, state_update in output.items():
+                    current_state.update(state_update)
                     event_data = {
                         "node": node_name,
-                        "steps": state_update.get("steps", 0),
+                        "steps": current_state.get("steps", 0),
                         "status": f"Completed node: {node_name}"
                     }
                     
                     if node_name == "retrieve":
-                        docs = state_update.get("documents", [])
+                        docs = current_state.get("documents", [])
                         event_data["document_count"] = len(docs)
                         
                     yield {
@@ -237,20 +239,17 @@ async def chat_endpoint(request: ChatRequest):
                         "data": json.dumps(event_data)
                     }
                     
-                    # Store final state to yield at the end
-                    final_state_update = state_update
-                    
             # Once graph completes, yield the final answer and cache it
-            if 'generation' in final_state_update:
-                answer = final_state_update['generation']
-                sources = final_state_update.get('documents', [])
+            if 'generation' in current_state:
+                answer = current_state['generation']
+                sources = current_state.get('documents', [])
                 
                 # Format sources for response
                 formatted_sources = [
                     {
                         "title": d.get("title", ""),
                         "content": d.get("content", ""),
-                        "score": d.get("score", 0.0),
+                        "score": float(d.get("score", 0.0)),
                         "url": d.get("url")
                     } for d in sources
                 ]
@@ -263,7 +262,8 @@ async def chat_endpoint(request: ChatRequest):
                         "strategies_used": list(
                             k for k, v in request.strategies.model_dump().items() if v
                         ),
-                        "agent_steps": final_state_update.get("steps", 0),
+                        "agent_steps": current_state.get("steps", 0),
+                        "expanded_queries": current_state.get("expanded_queries", []),
                     }
                 }
                 
@@ -324,6 +324,7 @@ async def chat_compare(request: Request):
             "answer_retries": 0,
         }
 
+        from backend.agent import agent_app
         import time as time_mod
         start = time_mod.monotonic()
         try:

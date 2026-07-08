@@ -17,6 +17,7 @@ pipeline fully offline with no external API dependencies for retrieval.
 import hashlib
 import logging
 import uuid
+import asyncio
 from typing import List, Optional
 
 from qdrant_client.http import models
@@ -100,19 +101,30 @@ async def search_articles(query: str, top_k: Optional[int] = None) -> List[str]:
     """
     settings = get_settings()
     effective_top_k = top_k or settings.article_search_top_k
-    qdrant = get_async_qdrant()
     dense_model = get_dense_model()
 
     # Generate query embedding
     query_vector = list(dense_model.embed([query]))[0].tolist()
 
     try:
-        results = await qdrant.query_points(
-            collection_name=settings.article_collection,
-            query=query_vector,
-            limit=effective_top_k,
-            with_payload=True,
-        )
+        qdrant_async = get_async_qdrant()
+        if qdrant_async is not None:
+            results = await qdrant_async.query_points(
+                collection_name=settings.article_collection,
+                query=query_vector,
+                limit=effective_top_k,
+                with_payload=True,
+            )
+        else:
+            # Embedded mode: use sync client via thread
+            sync_client = get_sync_qdrant()
+            results = await asyncio.to_thread(
+                sync_client.query_points,
+                collection_name=settings.article_collection,
+                query=query_vector,
+                limit=effective_top_k,
+                with_payload=True,
+            )
 
         titles = []
         for point in results.points:

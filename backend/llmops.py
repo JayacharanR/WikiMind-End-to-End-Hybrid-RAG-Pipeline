@@ -104,8 +104,9 @@ def get_guardrails() -> Optional[LLMRails]:
     """
     config_path = os.path.join(os.path.dirname(__file__), "guardrails_config")
     try:
+        from backend.agent import _get_llm
         config = RailsConfig.from_path(config_path)
-        rails = LLMRails(config)
+        rails = LLMRails(config, llm=_get_llm())
         logger.info("NeMo Guardrails initialized from %s", config_path)
         return rails
     except Exception as exc:
@@ -136,9 +137,16 @@ async def safe_generate(query: str, context: str = "") -> str:
         logger.error("Guardrails not available. Cannot generate safely.")
         return "Error: Safety guardrails are not initialized."
 
+    # Append strict anti-tool-call instruction to the query for the local Llama model
+    strict_query = (
+        f"{query}\n\n"
+        "IMPORTANT: Do not output JSON. Do not output tool calls. Answer the question directly in plain text using the context. "
+        "Always list the URLs of the Wikipedia articles you used as References at the very end of your answer."
+    )
+
     messages = [
         {"role": "context", "content": {"relevant_chunks": context}},
-        {"role": "user", "content": query},
+        {"role": "user", "content": strict_query},
     ]
 
     response = await rails_app.generate_async(messages=messages)

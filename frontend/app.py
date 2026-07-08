@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import requests
+import time
 from typing import Dict, Any
 
 import sseclient
@@ -122,6 +123,7 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
         payload["as_of_date"] = as_of_date
     
     try:
+        start_time = time.time()
         # Use requests to get the SSE stream
         response = requests.post(
             f"{API_URL}/chat", 
@@ -145,6 +147,7 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                 status_placeholder.info(f"Agent working: {status} ({node})")
                 
             elif event.event == "final":
+                total_time = time.time() - start_time
                 data = json.loads(event.data)
                 
                 # Clear status
@@ -152,7 +155,23 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                 
                 # Render answer
                 answer = data.get("answer", "")
+                
+                # If answer is a JSON tool call, parse it out
+                try:
+                    ans_json = json.loads(answer)
+                    if isinstance(ans_json, dict) and ans_json.get("name") == "generate_text":
+                        params = ans_json.get("parameters", {})
+                        if isinstance(params, str):
+                            params = json.loads(params)
+                        answer = params.get("input", answer)
+                except Exception:
+                    pass
+                
                 answer_placeholder.markdown(answer)
+                
+                # Render metadata and add total time taken
+                metadata = data.get("metadata", {})
+                metadata["total_time_seconds"] = round(total_time, 2)
                 
                 # Render sources
                 sources = data.get("sources", [])
@@ -165,8 +184,19 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                                 st.markdown(f"[Read on Wikipedia]({source.get('url')})")
                             st.divider()
                             
-                # Render metadata
-                metadata = data.get("metadata", {})
+                # Render expanded queries if any
+                expanded_queries = metadata.get("expanded_queries", [])
+                strategies_used = metadata.get("strategies_used", [])
+                if len(expanded_queries) > 1:
+                    if "hyde" in strategies_used:
+                        with st.expander("View Hypothetical Document (HyDE)"):
+                            for q in expanded_queries[1:]:
+                                st.markdown(f"> {q}")
+                    else:
+                        with st.expander("View Expanded Queries"):
+                            for q in expanded_queries[1:]:
+                                st.markdown(f"- {q}")
+                            
                 with st.expander("Execution Metadata"):
                     st.json(metadata)
                     
@@ -209,6 +239,17 @@ def chat_page():
                                 st.markdown(f"[Read on Wikipedia]({source.get('url')})")
                             st.divider()
                 if message.get("metadata"):
+                    expanded_queries = message["metadata"].get("expanded_queries", [])
+                    strategies_used = message["metadata"].get("strategies_used", [])
+                    if len(expanded_queries) > 1:
+                        if "hyde" in strategies_used:
+                            with st.expander("View Hypothetical Document (HyDE)"):
+                                for q in expanded_queries[1:]:
+                                    st.markdown(f"> {q}")
+                        else:
+                            with st.expander("View Expanded Queries"):
+                                for q in expanded_queries[1:]:
+                                    st.markdown(f"- {q}")
                     with st.expander("Execution Metadata"):
                         st.json(message["metadata"])
                         
@@ -237,11 +278,11 @@ def main():
     from frontend.pages.ab_dashboard import render_ab_dashboard
     from frontend.pages.eval_results import render_eval_results
 
-    pages = {
-        "Chat": st.Page(chat_page, title="Chat", icon=":material/chat:"),
-        "A/B Dashboard": st.Page(render_ab_dashboard, title="A/B Dashboard", icon=":material/compare_arrows:"),
-        "Eval Results": st.Page(render_eval_results, title="Eval Results", icon=":material/analytics:"),
-    }
+    pages = [
+        st.Page(chat_page, title="Chat", icon=":material/chat:"),
+        st.Page(render_ab_dashboard, title="A/B Dashboard", icon=":material/compare_arrows:"),
+        st.Page(render_eval_results, title="Eval Results", icon=":material/analytics:"),
+    ]
 
     nav = st.navigation(pages)
     nav.run()

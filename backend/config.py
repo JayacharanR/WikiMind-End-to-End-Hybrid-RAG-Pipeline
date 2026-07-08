@@ -28,6 +28,7 @@ class Settings(BaseSettings):
     # --- OpenRouter -------------------------------------------------------
     openrouter_api_key: str = ""
     openrouter_model: str = "gpt-oss-20b:free"
+    llm_base_url: str = "https://openrouter.ai/api/v1"
 
     # --- Embedding Model --------------------------------------------------
     # Dense embedding model used for semantic vector generation.
@@ -37,6 +38,9 @@ class Settings(BaseSettings):
     embedding_dim: int = 384
 
     # --- Qdrant Vector Database -------------------------------------------
+    # QDRANT_MODE: "local" = embedded mode (no Docker), "remote" = server mode
+    qdrant_mode: str = "local"
+    qdrant_local_path: str = "data/qdrant_storage"
     qdrant_url: str = "http://localhost:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "wikimind_hybrid"

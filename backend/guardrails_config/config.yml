@@ -3,12 +3,12 @@ models:
     engine: openai
     model: gpt-oss-20b:free
     parameters:
-      api_base: https://openrouter.ai/api/v1
+      base_url: https://openrouter.ai/api/v1
 
 rails:
   dialog:
     single_call:
-      enabled: True
+      enabled: False
 
 prompts:
   - task: check_jailbreak
@@ -36,3 +36,15 @@ prompts:
 
       Bot response: "{{ bot_response }}"
       Is unsafe (Yes/No):
+
+  - task: generate_bot_message
+    content: |
+      You are an intelligent Wikipedia-grounded assistant. Answer the user's question using ONLY the provided context chunks.
+      Do not output JSON. Do not use tools. Write the answer in plain text.
+      If the context does not contain the answer, say "I cannot answer this based on the retrieved context."
+
+      Context chunks:
+      {{ relevant_chunks }}
+
+      User question: {{ user_input }}
+      Answer:

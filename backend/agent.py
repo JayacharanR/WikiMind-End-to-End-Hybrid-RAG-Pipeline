@@ -57,7 +57,7 @@ def _get_llm(temperature: float = 0.0, max_tokens: int = 256) -> ChatOpenAI:
     return ChatOpenAI(
         model=settings.openrouter_model,
         api_key=settings.openrouter_api_key,
-        base_url="https://openrouter.ai/api/v1",
+        base_url=settings.llm_base_url,
         temperature=temperature,
         max_tokens=max_tokens,
     )
@@ -294,7 +294,7 @@ async def node_generate_from_web(state: AgentState) -> Dict:
 
     if web_snippets:
         context = "\n\n".join(
-            f"Title: {d.get('title')}\nContent: {d.get('content')}"
+            f"Title: {d.get('title')}\nURL: {d.get('url', 'N/A')}\nContent: {d.get('content')}"
             for d in web_snippets
         )
     else:
@@ -313,7 +313,7 @@ async def node_generate(state: AgentState) -> Dict:
     logger.info("--- NODE: GENERATE (step %d) ---", steps)
 
     context = "\n\n".join(
-        f"Title: {d.get('title')}\nContent: {d.get('content')}"
+        f"Title: {d.get('title')}\nURL: {d.get('url', 'N/A')}\nContent: {d.get('content')}"
         for d in documents
     )
 

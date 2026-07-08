@@ -6,6 +6,7 @@ article-scoped filtering to restrict search to specific Wikipedia articles
 identified by the web-search discovery step.
 """
 
+import asyncio
 import logging
 from typing import List, Dict, Any, Optional
 from urllib.parse import unquote, urlparse
@@ -13,7 +14,7 @@ from urllib.parse import unquote, urlparse
 from qdrant_client.http import models
 
 from backend.config import get_settings
-from backend.qdrant_client import get_async_qdrant
+from backend.qdrant_client import get_async_qdrant, get_sync_qdrant
 from data_pipeline.ingest import get_dense_model, get_sparse_model
 
 from flashrank import Ranker, RerankRequest
@@ -105,7 +106,6 @@ async def hybrid_search(
         Tuple of (List of candidate documents, Metadata dict).
     """
     settings = get_settings()
-    qdrant = get_async_qdrant()
 
     dense_model = get_dense_model()
     sparse_model = get_sparse_model()
@@ -187,13 +187,26 @@ async def hybrid_search(
     }
 
     try:
-        results = await qdrant.query_points(
-            collection_name=settings.qdrant_collection,
-            prefetch=[prefetch_dense, prefetch_sparse],
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=settings.retrieval_top_k,
-            with_payload=True,
-        )
+        qdrant_async = get_async_qdrant()
+        if qdrant_async is not None:
+            results = await qdrant_async.query_points(
+                collection_name=settings.qdrant_collection,
+                prefetch=[prefetch_dense, prefetch_sparse],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=settings.retrieval_top_k,
+                with_payload=True,
+            )
+        else:
+            # Embedded mode: use sync client via thread
+            sync_client = get_sync_qdrant()
+            results = await asyncio.to_thread(
+                sync_client.query_points,
+                collection_name=settings.qdrant_collection,
+                prefetch=[prefetch_dense, prefetch_sparse],
+                query=models.FusionQuery(fusion=models.Fusion.RRF),
+                limit=settings.retrieval_top_k,
+                with_payload=True,
+            )
 
         # Format results
         documents = []
