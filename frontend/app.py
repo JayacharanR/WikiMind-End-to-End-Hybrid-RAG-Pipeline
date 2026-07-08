@@ -25,6 +25,112 @@ logger = logging.getLogger(__name__)
 API_URL = os.getenv("API_URL", "http://localhost:8000")
 
 
+def inject_llama_css():
+    st.markdown(
+        """
+        <style>
+        /* Open WebUI / Llama WebUI Theme */
+        
+        /* General Backgrounds */
+        .stApp, .stAppViewBlockContainer {
+            background-color: #111111 !important;
+            color: #E5E5E5 !important;
+            font-family: system-ui, -apple-system, sans-serif !important;
+        }
+        [data-testid="stSidebar"] {
+            background-color: #0A0A0A !important;
+            border-right: none !important;
+        }
+        
+        /* Chat Input Container */
+        .stChatInputContainer {
+            background-color: transparent !important;
+            border: none !important;
+            padding-bottom: 2rem !important;
+        }
+        .stChatInputContainer > div {
+            background-color: #2F2F2F !important;
+            border: none !important;
+            border-radius: 25px !important;
+            padding: 4px 10px !important;
+            box-shadow: 0 4px 6px rgba(0, 0, 0, 0.3) !important;
+        }
+        .stChatInputContainer textarea {
+            color: #FFFFFF !important;
+        }
+        
+        /* Default Streamlit Chat Bubble overrides */
+        [data-testid="stChatMessage"] {
+            background-color: transparent !important;
+            border: none !important;
+            padding: 0.5rem !important;
+            animation: slideUp 0.3s ease-out forwards;
+            opacity: 0;
+            transform: translateY(10px);
+        }
+        
+        /* Flexbox overrides for User vs Assistant */
+        
+        /* Assistant Message */
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) {
+            display: flex !important;
+            flex-direction: row !important;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-assistant"]) .stMarkdown {
+            color: #E5E5E5 !important;
+        }
+        
+        /* User Message */
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+            display: flex !important;
+            flex-direction: row-reverse !important;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) .stMarkdown {
+            background-color: #2F2F2F !important;
+            padding: 12px 18px !important;
+            border-radius: 18px 18px 0px 18px !important;
+            display: inline-block !important;
+            max-width: 80% !important;
+            color: #FFFFFF !important;
+        }
+        [data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) .stChatMessageAvatar {
+            display: none !important; /* Hide user avatar */
+        }
+        
+        /* Clean Headers */
+        [data-testid="stHeader"] {
+            display: none !important;
+        }
+        footer {
+            display: none !important;
+        }
+        
+        /* Empty State Headers */
+        .empty-state-title {
+            text-align: center;
+            font-size: 2.5rem;
+            font-weight: 600;
+            margin-top: 15vh;
+            color: #FFFFFF;
+        }
+        .empty-state-subtitle {
+            text-align: center;
+            font-size: 1rem;
+            color: #888888;
+            margin-bottom: 2rem;
+        }
+        
+        /* Animations */
+        @keyframes slideUp {
+            from { opacity: 0; transform: translateY(10px); }
+            to { opacity: 1; transform: translateY(0); }
+        }
+        </style>
+        """,
+        unsafe_allow_html=True
+    )
+
+
 def configure_sidebar() -> Dict[str, Any]:
     """Render the configuration sidebar and return the selected strategies."""
     st.sidebar.title("WikiMind Configuration")
@@ -215,8 +321,6 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
 
 def chat_page():
     """Render the main chat interface page."""
-    st.title("WikiMind RAG Pipeline")
-    st.markdown("Ask complex questions. The agent uses Two-Stage Hybrid RAG: a local article index identifies Wikipedia articles, then Qdrant hybrid search extracts precise answers.")
     
     # Sidebar config
     strategies = configure_sidebar()
@@ -224,6 +328,10 @@ def chat_page():
     # Initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
+        
+    if len(st.session_state.messages) == 0:
+        st.markdown('<div class="empty-state-title">Hello there</div>', unsafe_allow_html=True)
+        st.markdown('<div class="empty-state-subtitle">Type a message to get started with WikiMind</div>', unsafe_allow_html=True)
         
     # Display chat history
     for message in st.session_state.messages:
@@ -271,17 +379,18 @@ def main():
     """Multi-page Streamlit application entry point."""
     st.set_page_config(
         page_title="WikiMind | Hybrid RAG Pipeline",
-        page_icon="W",
         layout="wide",
     )
+    
+    inject_llama_css()
 
     from frontend.pages.ab_dashboard import render_ab_dashboard
     from frontend.pages.eval_results import render_eval_results
 
     pages = [
-        st.Page(chat_page, title="Chat", icon=":material/chat:"),
-        st.Page(render_ab_dashboard, title="A/B Dashboard", icon=":material/compare_arrows:"),
-        st.Page(render_eval_results, title="Eval Results", icon=":material/analytics:"),
+        st.Page(chat_page, title="Chat", icon=":material/terminal:"),
+        st.Page(render_ab_dashboard, title="A/B Dashboard", icon=":material/radar:"),
+        st.Page(render_eval_results, title="Eval Results", icon=":material/troubleshoot:"),
     ]
 
     nav = st.navigation(pages)
