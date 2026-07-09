@@ -33,6 +33,7 @@ qdrant_storage/
 redis_data/
 grafana_data/
 prometheus_data/
+qdrant_server
 
 # Data pipeline artifacts
 *.parquet

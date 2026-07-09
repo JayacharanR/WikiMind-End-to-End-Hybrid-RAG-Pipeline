@@ -41,7 +41,7 @@ class Settings(BaseSettings):
     # QDRANT_MODE: "local" = embedded mode (no Docker), "remote" = server mode
     qdrant_mode: str = "local"
     qdrant_local_path: str = "data/qdrant_storage"
-    qdrant_url: str = "http://localhost:6333"
+    qdrant_url: str = "http://127.0.0.1:6333"
     qdrant_api_key: str = ""
     qdrant_collection: str = "wikimind_hybrid"
     article_collection: str = "wikimind_articles"

@@ -14,6 +14,16 @@ import json
 import logging
 import os
 import sys
+import queue
+import threading
+
+# For Windows + Python 3.8+: inject cuDNN dlls so ONNX Runtime doesn't fallback to CPU
+if os.name == 'nt':
+    cudnn_path = r"D:\adobe and davinci resolve files"
+    if os.path.exists(cudnn_path):
+        os.environ["PATH"] = cudnn_path + os.pathsep + os.environ.get("PATH", "")
+        os.add_dll_directory(cudnn_path)
+
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
@@ -47,8 +57,11 @@ def get_dense_model() -> TextEmbedding:
         settings = get_settings()
         # For this MVP, we use the local fastembed model. 
         # In a real scenario, this could switch based on config (e.g. OpenAI).
-        logger.info("Initializing dense embedding model: %s", settings.embedding_model)
-        _dense_model = TextEmbedding(model_name=settings.embedding_model)
+        logger.info("Initializing dense embedding model: %s (GPU mode)", settings.embedding_model)
+        _dense_model = TextEmbedding(
+            model_name=settings.embedding_model,
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
     return _dense_model
 
 
@@ -57,7 +70,10 @@ def get_sparse_model() -> SparseTextEmbedding:
     global _sparse_model
     if _sparse_model is None:
         logger.info("Initializing sparse embedding model: Qdrant/bm25")
-        _sparse_model = SparseTextEmbedding(model_name="Qdrant/bm25")
+        _sparse_model = SparseTextEmbedding(
+            model_name="Qdrant/bm25",
+            providers=["CUDAExecutionProvider", "CPUExecutionProvider"]
+        )
     return _sparse_model
 
 
@@ -153,7 +169,7 @@ def _upsert_article_entries(articles: List[Dict[str, Any]]) -> None:
         return
 
     # Embed all article summaries in one batch
-    embeddings = list(dense_model.embed(summaries))
+    embeddings = list(dense_model.embed(summaries, batch_size=1024))
 
     # Assemble Qdrant points
     points = []
@@ -170,12 +186,37 @@ def _upsert_article_entries(articles: List[Dict[str, Any]]) -> None:
             )
         )
 
-    client.upsert(
+    client.upload_points(
         collection_name=settings.article_collection,
         points=points,
+        wait=False,
+        batch_size=256,
+        max_retries=3,
     )
     logger.debug("Upserted %d article-level entries.", len(points))
 
+
+def prefetch_generator(generator, max_prefetch=5000):
+    """Run a generator in a background thread to prevent I/O blocking."""
+    q = queue.Queue(maxsize=max_prefetch)
+    
+    def worker():
+        try:
+            for item in generator:
+                q.put(item)
+        except Exception as e:
+            logger.error(f"Prefetch error: {e}")
+        finally:
+            q.put(None)
+            
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        yield item
 
 # ---------------------------------------------------------------------------
 # Ingestion Pipeline
@@ -260,10 +301,10 @@ def process_batch(
     texts_to_embed = [p["text"] for p in points]
     
     # Dense embeddings
-    dense_embeddings = list(dense_model.embed(texts_to_embed))
+    dense_embeddings = list(dense_model.embed(texts_to_embed, batch_size=1024))
     
     # Sparse embeddings
-    sparse_embeddings = list(sparse_model.embed(texts_to_embed))
+    sparse_embeddings = list(sparse_model.embed(texts_to_embed, batch_size=1024))
 
     # 3. Assemble Qdrant Points
     qdrant_points = []
@@ -298,14 +339,14 @@ def process_batch(
             )
         )
 
-    # 4. Upsert in sub-batches (Qdrant has a 33 MB JSON payload limit)
-    UPSERT_BATCH = 200
-    for sub_start in range(0, len(qdrant_points), UPSERT_BATCH):
-        sub_batch = qdrant_points[sub_start : sub_start + UPSERT_BATCH]
-        client.upsert(
-            collection_name=settings.qdrant_collection,
-            points=sub_batch,
-        )
+    # 4. Upsert (upload_points automatically handles batching and multithreading!)
+    client.upload_points(
+        collection_name=settings.qdrant_collection,
+        points=qdrant_points,
+        wait=False,
+        batch_size=256,
+        max_retries=3,
+    )
     
     logger.debug("Upserted %d chunks from %d articles.", len(qdrant_points), len(articles))
     return len(qdrant_points)
@@ -515,6 +556,9 @@ def run_ingestion(
         logger.info("Skipping first %d articles (resuming from checkpoint)...", processed_count)
         dataset = dataset.skip(processed_count)
 
+    # Wrap the dataset in a background prefetch thread to prevent network I/O from starving the GPU
+    dataset = prefetch_generator(dataset, max_prefetch=2000)
+
     batch = []
     start_time = time.monotonic()
     articles_this_session = 0
@@ -522,16 +566,20 @@ def run_ingestion(
     last_title = checkpoint.get("last_article_title", "")
     
     try:
-        for article in dataset:
-            batch.append(article)
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as executor:
+            futures_queue = []
             
-            if len(batch) >= batch_size:
-                batch_chunks = process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
-                processed_count += len(batch)
-                articles_this_session += len(batch)
+            def process_completed(f_done, batch_done):
+                nonlocal processed_count, articles_this_session, chunks_this_session
+                nonlocal total_chunks, last_title, start_time
+                
+                batch_chunks = f_done.result()
+                processed_count += len(batch_done)
+                articles_this_session += len(batch_done)
                 chunks_this_session += batch_chunks
                 total_chunks += batch_chunks
-                last_title = batch[-1].get("title", "")
+                last_title = batch_done[-1].get("title", "")
 
                 save_checkpoint(
                     articles_processed=processed_count,
@@ -543,14 +591,12 @@ def run_ingestion(
                 rate = articles_this_session / elapsed if elapsed > 0 else 0
                 chunk_rate = chunks_this_session / elapsed if elapsed > 0 else 0
 
-                # ETA calculation
                 if max_articles > 0 and rate > 0:
                     remaining = max_articles - processed_count
                     eta_seconds = remaining / rate
                 else:
                     eta_seconds = -1
 
-                # Live progress display
                 _print_progress(
                     articles_done=processed_count,
                     articles_target=max_articles if max_articles > 0 else processed_count,
@@ -563,7 +609,6 @@ def run_ingestion(
                     qdrant_path=settings.qdrant_local_path,
                 )
 
-                # Also log for file logging
                 if max_articles > 0:
                     logger.info(
                         "[%d/%s] %.1f articles/sec | %d chunks | ETA: %s",
@@ -575,13 +620,29 @@ def run_ingestion(
                         "[%d/%s] %.1f articles/sec | %d chunks",
                         processed_count, target_label, rate, total_chunks,
                     )
+
+            for article in dataset:
+                batch.append(article)
                 
-                batch = []
-                
-                if max_articles > 0 and processed_count >= max_articles:
-                    logger.info("Reached target (%d articles). Done.", max_articles)
-                    break
+                if len(batch) >= batch_size:
+                    f = executor.submit(process_batch, list(batch), articles_only, skip_ner)
+                    futures_queue.append((f, list(batch)))
+                    batch = []
                     
+                    if len(futures_queue) >= 4:
+                        f_done, batch_done = futures_queue.pop(0)
+                        process_completed(f_done, batch_done)
+                        
+                        if max_articles > 0 and processed_count >= max_articles:
+                            logger.info("Reached target (%d articles). Done.", max_articles)
+                            break
+                            
+            # Flush remaining inflight futures
+            for f_done, batch_done in futures_queue:
+                if max_articles > 0 and processed_count >= max_articles:
+                    break
+                process_completed(f_done, batch_done)
+
         # Process any remaining
         if batch and (max_articles <= 0 or processed_count < max_articles):
             batch_chunks = process_batch(batch, articles_only=articles_only, skip_ner=skip_ner)
