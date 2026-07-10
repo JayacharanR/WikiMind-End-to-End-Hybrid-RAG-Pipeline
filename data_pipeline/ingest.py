@@ -169,7 +169,7 @@ def _upsert_article_entries(articles: List[Dict[str, Any]]) -> None:
         return
 
     # Embed all article summaries in one batch
-    embeddings = list(dense_model.embed(summaries, batch_size=1024))
+    embeddings = list(dense_model.embed(summaries, batch_size=256))
 
     # Assemble Qdrant points
     points = []
@@ -301,10 +301,10 @@ def process_batch(
     texts_to_embed = [p["text"] for p in points]
     
     # Dense embeddings
-    dense_embeddings = list(dense_model.embed(texts_to_embed, batch_size=1024))
+    dense_embeddings = list(dense_model.embed(texts_to_embed, batch_size=256))
     
     # Sparse embeddings
-    sparse_embeddings = list(sparse_model.embed(texts_to_embed, batch_size=1024))
+    sparse_embeddings = list(sparse_model.embed(texts_to_embed, batch_size=256))
 
     # 3. Assemble Qdrant Points
     qdrant_points = []
