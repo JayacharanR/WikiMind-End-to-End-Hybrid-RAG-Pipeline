@@ -47,3 +47,6 @@ checkpoints/
 *~
 .idea/
 .vscode/
+
+storage/
+.qdrant-initialized

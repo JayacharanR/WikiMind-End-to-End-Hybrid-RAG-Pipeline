@@ -164,10 +164,14 @@ async def expand_query(query: str, strategies: QueryStrategies) -> List[str]:
     seen = set()
     unique_queries = []
     for q in expanded_queries:
+        # Ignore LLM tool-calling hallucinations (e.g. {"name": "search_wikipedia"...})
+        if "{" in q and "}" in q and '"name"' in q:
+            continue
+            
         q_lower = q.lower()
         if q_lower not in seen:
             seen.add(q_lower)
             unique_queries.append(q)
-            
-    logger.info("Query expansion generated %d unique queries.", len(unique_queries))
+
+    logger.info("Generated %d total queries for retrieval.", len(unique_queries))
     return unique_queries

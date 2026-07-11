@@ -178,7 +178,7 @@ async def node_retrieve(state: AgentState) -> Dict:
     for q in queries_to_search:
         docs, _ = await hybrid_search(
             q,
-            article_titles=target_articles if target_articles else None,
+            article_titles=None,  # Bypass strict article filtering to allow global Dense+Sparse RRF
             as_of_date=state.get("as_of_date")
         )
         for doc in docs:
@@ -258,15 +258,24 @@ async def node_grade_documents(state: AgentState) -> Dict:
 
         # Parse the comma-separated indices
         relevant_indices = set()
-        for part in content.replace(" ", "").split(","):
+        import re
+        # Find all numbers in the output, just in case there is extra text
+        for n in re.findall(r'\d+', content):
             try:
-                idx = int(part)
+                idx = int(n)
                 if 0 <= idx < len(documents):
                     relevant_indices.add(idx)
             except ValueError:
                 continue
 
-        filtered_docs = [documents[i] for i in sorted(relevant_indices)]
+        # If parsing yielded no indices, but the LLM didn't explicitly say 'none',
+        # it probably hallucinated a tool call or failed to format.
+        # Fallback to keeping the documents rather than throwing them away.
+        if not relevant_indices and "none" not in content.lower():
+            logger.warning("Grader failed to output valid indices. Output: %s. Keeping all docs.", content)
+            filtered_docs = documents
+        else:
+            filtered_docs = [documents[i] for i in sorted(relevant_indices)]
 
         grade = "relevant" if filtered_docs else "irrelevant"
         logger.info(
@@ -302,7 +311,23 @@ async def node_generate_from_web(state: AgentState) -> Dict:
     else:
         context = "No relevant context was found."
 
-    generation = await safe_generate(query=query, context=context)
+    llm = _get_llm(temperature=0.0, max_tokens=500)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", 
+         "You are an intelligent Wikipedia-grounded assistant. Answer the user's question using ONLY the provided context chunks.\n"
+         "If the context does not contain the answer, you MUST say exactly: 'I cannot answer this based on the retrieved context.'\n"
+         "Context:\n{context}"),
+        ("user", 
+         "Question: {query}\n\n"
+         "CRITICAL: Answer directly in plain English sentences. DO NOT output JSON. DO NOT output function calls. Write your answer below:")
+    ])
+    
+    try:
+        res = await (prompt | llm).ainvoke({"context": context, "query": query})
+        generation = str(res.content)
+    except Exception as exc:
+        generation = "Error generating fallback response."
+        
     return {"generation": generation, "documents": web_snippets, "steps": steps}
 
 
@@ -319,7 +344,23 @@ async def node_generate(state: AgentState) -> Dict:
         for d in documents
     )
 
-    generation = await safe_generate(query=query, context=context)
+    llm = _get_llm(temperature=0.0, max_tokens=500)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", 
+         "You are a strict, factual Wikipedia-grounded assistant. Answer the user's question using ONLY the provided context chunks.\n"
+         "If the context does not explicitly contain the answer, you MUST say exactly: 'I cannot answer this based on the retrieved context.'\n"
+         "Context:\n{context}"),
+        ("user", 
+         "Question: {query}\n\n"
+         "CRITICAL: Answer directly in plain English sentences. DO NOT output JSON. DO NOT output function calls. Write your answer below:")
+    ])
+    
+    try:
+        res = await (prompt | llm).ainvoke({"context": context, "query": query})
+        generation = str(res.content)
+    except Exception as exc:
+        generation = "Error generating response."
+
     return {"generation": generation, "steps": steps}
 
 

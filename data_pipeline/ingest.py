@@ -24,6 +24,15 @@ if os.name == 'nt':
         os.environ["PATH"] = cudnn_path + os.pathsep + os.environ.get("PATH", "")
         os.add_dll_directory(cudnn_path)
 
+# Force all caching to happen on the D drive instead of the C drive
+cache_dir = r"D:\charan project\WikiMind-End-to-End-Hybrid-RAG-Pipeline\data\cache"
+os.makedirs(cache_dir, exist_ok=True)
+os.environ["HF_HOME"] = os.path.join(cache_dir, "huggingface")
+os.environ["FASTEMBED_CACHE_PATH"] = os.path.join(cache_dir, "fastembed")
+os.environ["TMPDIR"] = cache_dir
+os.environ["TEMP"] = cache_dir
+os.environ["TMP"] = cache_dir
+
 import time
 from datetime import datetime, timezone
 from typing import Any, Dict, List
