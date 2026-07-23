@@ -77,14 +77,64 @@ def init_observability() -> None:
         logger.warning("Langfuse connection check failed: %s", exc)
 
 
-def get_langfuse_handler() -> Optional[LangfuseCallbackHandler]:
+def get_langfuse_handler(**kwargs) -> Optional[LangfuseCallbackHandler]:
+    """Create a LangfuseCallbackHandler for LangChain/LangGraph tracing.
+
+    Returns a handler that instruments all LLM calls with Langfuse traces.
+    Returns None when Langfuse credentials are not configured.
+
+    Args:
+        **kwargs: Extra arguments passed to LangfuseCallbackHandler
+                  (e.g., session_id, user_id, trace_name).
+
+    Returns:
+        Optional[LangfuseCallbackHandler]: Handler or None.
+    """
     secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
     public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
 
-    if not secret_key or not public_key or "placeholder" in secret_key or "placeholder" in public_key:
+    if not secret_key or not public_key or "placeholder" in secret_key:
         return None
 
-    return LangfuseCallbackHandler()
+    try:
+        return LangfuseCallbackHandler(
+            secret_key=secret_key,
+            public_key=public_key,
+            host=os.getenv("LANGFUSE_HOST", "http://localhost:3000"),
+            **kwargs,
+        )
+    except Exception as exc:
+        logger.warning("Failed to create Langfuse handler: %s", exc)
+        return None
+
+
+def push_eval_scores(
+    trace_name: str,
+    scores: dict,
+    metadata: dict = None,
+) -> None:
+    """Push evaluation scores to Langfuse for a completed trace.
+
+    Used by the evaluation harness to record benchmark results
+    (recall, accuracy, latency) as Langfuse scores.
+
+    Args:
+        trace_name: Name identifying the evaluation run.
+        scores: Dict of metric_name -> float value.
+        metadata: Optional metadata dict for the trace.
+    """
+    client = get_langfuse_client()
+    if client is None:
+        return
+
+    try:
+        trace = client.trace(name=trace_name, metadata=metadata or {})
+        for metric_name, value in scores.items():
+            trace.score(name=metric_name, value=value)
+        client.flush()
+        logger.info("Pushed %d eval scores to Langfuse trace '%s'.", len(scores), trace_name)
+    except Exception as exc:
+        logger.warning("Failed to push eval scores to Langfuse: %s", exc)
 
 
 # ---------------------------------------------------------------------------

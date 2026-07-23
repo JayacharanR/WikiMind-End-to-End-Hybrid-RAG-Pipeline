@@ -210,9 +210,15 @@ async def chat_endpoint(request: ChatRequest):
             "as_of_date": request.as_of_date,
         }
         
-        # Setup Langfuse callbacks
+        # Setup Langfuse callbacks for per-query tracing
         config = {}
-        handler = get_langfuse_handler()
+        handler = get_langfuse_handler(
+            trace_name="wikimind_query",
+            session_id=f"session_{int(time.time())}",
+            metadata={"query": query[:100], "strategies": list(
+                k for k, v in request.strategies.model_dump().items() if v
+            )},
+        )
         if handler:
             config = {"callbacks": [handler]}
             

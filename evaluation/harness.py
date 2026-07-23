@@ -79,6 +79,7 @@ async def _evaluate_single_query(
         "active_strategies": active_strategies,
         "hallucination_retries": 0,
         "answer_retries": 0,
+        "as_of_date": None,
     }
 
     start_time = time.monotonic()
@@ -197,6 +198,30 @@ async def run_evaluation(
         config=config,
         dataset_name=dataset_name,
     )
+
+    # Push aggregate metrics to Langfuse (if available)
+    try:
+        from backend.llmops import push_eval_scores
+        from evaluation.metrics import compute_aggregate_metrics
+
+        aggregates = compute_aggregate_metrics(per_query_results)
+        push_eval_scores(
+            trace_name=f"eval_{dataset_name}_{config.get('name', 'unknown')}",
+            scores={
+                "recall_at_5": aggregates.get("mean_recall_at_5", 0.0),
+                "mrr": aggregates.get("mean_mrr", 0.0),
+                "answer_accuracy": aggregates.get("mean_answer_accuracy", 0.0),
+                "latency_p50": aggregates.get("latency_p50", 0.0),
+                "step_count": aggregates.get("mean_step_count", 0.0),
+            },
+            metadata={
+                "dataset": dataset_name,
+                "subset_size": len(samples),
+                "config": config,
+            },
+        )
+    except Exception as exc:
+        logger.warning("Failed to push eval scores to Langfuse: %s", exc)
 
     logger.info("Evaluation complete. Report: %s", report_path)
     return report_path

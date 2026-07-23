@@ -88,16 +88,34 @@ def load_nq_subset(n: int = 500) -> List[Dict]:
             break
 
         # Extract short answers from the annotations
+        # HuggingFace NQ format: annotations is a dict with nested lists
+        # short_answers has start_token/end_token as lists of lists (per annotator)
         annotations = example.get("annotations", {})
-        short_answers = annotations.get("short_answers", [])
+        short_answers = annotations.get("short_answers", {})
 
-        if not short_answers:
+        # short_answers is a dict with keys: start_token, end_token, start_byte, end_byte, text
+        # Each value is a list of lists (one list per annotator)
+        start_tokens_per_annotator = short_answers.get("start_token", [])
+        end_tokens_per_annotator = short_answers.get("end_token", [])
+
+        if not start_tokens_per_annotator or not end_tokens_per_annotator:
             continue
 
-        # Get the first non-empty short answer
-        first_answer = short_answers[0] if short_answers else {}
-        start_token = first_answer.get("start_token", -1)
-        end_token = first_answer.get("end_token", -1)
+        # Find the first annotator with a non-empty answer span
+        start_token = -1
+        end_token = -1
+        for ann_starts, ann_ends in zip(start_tokens_per_annotator, end_tokens_per_annotator):
+            if isinstance(ann_starts, list):
+                # Each annotator provides a list of spans; take the first
+                if ann_starts and ann_ends:
+                    start_token = ann_starts[0]
+                    end_token = ann_ends[0]
+                    break
+            elif isinstance(ann_starts, int) and ann_starts >= 0:
+                # Some formats provide ints directly
+                start_token = ann_starts
+                end_token = ann_ends
+                break
 
         if start_token < 0 or end_token < 0:
             continue

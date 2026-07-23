@@ -1,0 +1,137 @@
+{
+  "dataset": "nq",
+  "timestamp": "20260723_132001",
+  "config": {
+    "name": "with_expansion",
+    "description": "Pipeline with multi-query reformulation and step-back abstraction enabled for broader recall.",
+    "strategies": {
+      "multi_query": true,
+      "hyde": false,
+      "step_back": true,
+      "decomposition": false,
+      "page_index": false
+    }
+  },
+  "aggregates": {
+    "mean_recall_at_5": 0.9,
+    "mean_mrr": 0.725,
+    "mean_answer_accuracy": 0.8,
+    "latency_p50": 17.9238,
+    "latency_p95": 20.3011,
+    "latency_p99": 20.8364,
+    "mean_step_count": 16,
+    "total_queries": 10
+  },
+  "per_query_results": [
+    {
+      "question": "What is the capital of France?",
+      "gold_answer": "Paris",
+      "generation": "Paris is the capital of France.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 1.0,
+      "latency": 18.8414,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "Who wrote Romeo and Juliet?",
+      "gold_answer": "William Shakespeare",
+      "generation": "Luigi Da Porto wrote the original novel \"Novella novamente ritrovata\" with the story of Romeo and Juliet, which was later reprised by William Shakespeare for his famous drama.",
+      "recall_at_5": 1.0,
+      "mrr": 0.5,
+      "answer_accuracy": 1.0,
+      "latency": 20.9702,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "What is the largest planet in the solar system?",
+      "gold_answer": "Jupiter",
+      "generation": "Jupiter is the largest planet in the solar system.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 1.0,
+      "latency": 19.4834,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "What year did World War II end?",
+      "gold_answer": "1945",
+      "generation": "World War II ended in 1945.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 1.0,
+      "latency": 17.2072,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "Who painted the Mona Lisa?",
+      "gold_answer": "Leonardo da Vinci",
+      "generation": "Leonardo da Vinci painted the Mona Lisa.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 1.0,
+      "latency": 18.6404,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "What is the chemical symbol for gold?",
+      "gold_answer": "Au",
+      "generation": "The chemical symbol for gold is Au.",
+      "recall_at_5": 1.0,
+      "mrr": 0.25,
+      "answer_accuracy": 1.0,
+      "latency": 16.5278,
+      "step_count": 16,
+      "document_count": 5
+    },
+    {
+      "question": "What is the speed of light in meters per second?",
+      "gold_answer": "299792458",
+      "generation": "I cannot answer this based on the retrieved context.",
+      "recall_at_5": 0.0,
+      "mrr": 0.0,
+      "answer_accuracy": 0.0,
+      "latency": 15.6132,
+      "step_count": 16,
+      "document_count": 1
+    },
+    {
+      "question": "Who was the first president of the United States?",
+      "gold_answer": "George Washington",
+      "generation": "George Washington was the first president of the United States.",
+      "recall_at_5": 1.0,
+      "mrr": 0.5,
+      "answer_accuracy": 1.0,
+      "latency": 14.6172,
+      "step_count": 16,
+      "document_count": 3
+    },
+    {
+      "question": "What is the tallest mountain in the world?",
+      "gold_answer": "Mount Everest",
+      "generation": "Mount Everest is the world's highest mountain, with a peak at 8,849 metres (29,031.7\u00a0ft) above sea level.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 1.0,
+      "latency": 19.2958,
+      "step_count": 16,
+      "document_count": 2
+    },
+    {
+      "question": "What is the currency of Japan?",
+      "gold_answer": "yen",
+      "generation": "I cannot answer this based on the retrieved context.",
+      "recall_at_5": 1.0,
+      "mrr": 1.0,
+      "answer_accuracy": 0.0,
+      "latency": 16.6106,
+      "step_count": 16,
+      "document_count": 5
+    }
+  ]
+}

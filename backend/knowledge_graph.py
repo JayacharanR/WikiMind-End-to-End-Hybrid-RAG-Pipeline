@@ -11,6 +11,7 @@ that span multiple articles.
 
 import json
 import logging
+import os
 from typing import Any, Dict, List, Optional, Set, Tuple
 
 import networkx as nx
@@ -23,6 +24,9 @@ logger = logging.getLogger(__name__)
 
 # Key for storing the serialized graph in Redis
 GRAPH_REDIS_KEY = "wikimind:knowledge_graph"
+
+# Local file fallback for graph persistence (works without Redis)
+GRAPH_LOCAL_PATH = os.path.join("data", "knowledge_graph.json")
 
 # spaCy NER entity types to extract
 TARGET_ENTITY_TYPES = {"PERSON", "ORG", "GPE", "LOC", "EVENT", "WORK_OF_ART"}
@@ -106,23 +110,75 @@ def build_co_occurrence_edges(
 
 
 # ---------------------------------------------------------------------------
-# Graph Persistence (Redis)
+# Graph Persistence (Redis + Local File Fallback)
 # ---------------------------------------------------------------------------
 
-async def save_graph_to_redis(graph: nx.DiGraph) -> None:
-    """Serialize and store the knowledge graph in Redis.
+def save_graph_to_file(graph: nx.DiGraph) -> None:
+    """Save the knowledge graph to a local JSON file as a fallback.
 
-    Uses NetworkX's node-link JSON format for compact serialization.
-    The graph is stored as a single Redis key with no TTL (persistent).
+    This ensures the graph persists even when Redis is unavailable.
 
     Args:
         graph: The NetworkX directed graph to store.
     """
-    client = await get_redis_client()
-    data = nx.node_link_data(graph)
-    serialized = json.dumps(data)
+    try:
+        os.makedirs(os.path.dirname(GRAPH_LOCAL_PATH), exist_ok=True)
+        data = nx.node_link_data(graph)
+        with open(GRAPH_LOCAL_PATH, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        logger.info(
+            "Saved knowledge graph to local file: %s (%d nodes, %d edges).",
+            GRAPH_LOCAL_PATH,
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+        )
+    except Exception as exc:
+        logger.error("Failed to save knowledge graph to file: %s", exc)
+
+
+def load_graph_from_file() -> Optional[nx.DiGraph]:
+    """Load the knowledge graph from a local JSON file.
+
+    Returns:
+        The deserialized NetworkX DiGraph, or None if the file is missing.
+    """
+    if not os.path.exists(GRAPH_LOCAL_PATH):
+        logger.info("No local knowledge graph file found at %s.", GRAPH_LOCAL_PATH)
+        return None
 
     try:
+        with open(GRAPH_LOCAL_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        graph = nx.node_link_graph(data)
+        logger.info(
+            "Loaded knowledge graph from local file: %d nodes, %d edges.",
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+        )
+        return graph
+    except Exception as exc:
+        logger.error("Failed to load knowledge graph from file: %s", exc)
+        return None
+
+
+async def save_graph_to_redis(graph: nx.DiGraph) -> None:
+    """Serialize and store the knowledge graph in Redis AND local file.
+
+    Uses NetworkX's node-link JSON format for compact serialization.
+    Always saves to a local JSON file as a fallback. Attempts Redis
+    persistence when available.
+
+    Args:
+        graph: The NetworkX directed graph to store.
+    """
+    # Always save to local file first (guaranteed to work)
+    save_graph_to_file(graph)
+
+    # Then try Redis
+    try:
+        client = await get_redis_client()
+        data = nx.node_link_data(graph)
+        serialized = json.dumps(data)
         await client.set(GRAPH_REDIS_KEY, serialized)
         logger.info(
             "Saved knowledge graph to Redis: %d nodes, %d edges.",
@@ -130,34 +186,36 @@ async def save_graph_to_redis(graph: nx.DiGraph) -> None:
             graph.number_of_edges(),
         )
     except Exception as exc:
-        logger.error("Failed to save knowledge graph to Redis: %s", exc)
+        logger.warning("Redis save failed (graph is persisted to local file): %s", exc)
 
 
 async def load_graph_from_redis() -> Optional[nx.DiGraph]:
-    """Load the knowledge graph from Redis.
+    """Load the knowledge graph from Redis, with local file fallback.
+
+    Tries Redis first for fastest access. If Redis is unavailable or the
+    key doesn't exist, falls back to loading from the local JSON file.
 
     Returns:
-        The deserialized NetworkX DiGraph, or None if not found.
+        The deserialized NetworkX DiGraph, or None if not found anywhere.
     """
-    client = await get_redis_client()
-
+    # Try Redis first
     try:
+        client = await get_redis_client()
         data = await client.get(GRAPH_REDIS_KEY)
-        if data is None:
-            logger.info("No knowledge graph found in Redis.")
-            return None
-
-        graph = nx.node_link_graph(json.loads(data))
-        logger.info(
-            "Loaded knowledge graph from Redis: %d nodes, %d edges.",
-            graph.number_of_nodes(),
-            graph.number_of_edges(),
-        )
-        return graph
-
+        if data is not None:
+            graph = nx.node_link_graph(json.loads(data))
+            logger.info(
+                "Loaded knowledge graph from Redis: %d nodes, %d edges.",
+                graph.number_of_nodes(),
+                graph.number_of_edges(),
+            )
+            return graph
+        logger.info("No knowledge graph found in Redis. Trying local file...")
     except Exception as exc:
-        logger.error("Failed to load knowledge graph from Redis: %s", exc)
-        return None
+        logger.warning("Redis load failed, falling back to local file: %s", exc)
+
+    # Fall back to local file
+    return load_graph_from_file()
 
 
 # ---------------------------------------------------------------------------

@@ -13,9 +13,11 @@ services:
     environment:
       - QDRANT_URL=http://qdrant:6333
       - REDIS_URL=redis://redis:6379/0
-      - PROMETHEUS_MULTIPROC_DIR=/tmp/metrics
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-wikimind-dev}
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-wikimind-dev}
     volumes:
-      - prometheus_data:/tmp/metrics
+      - ./data:/app/data
     depends_on:
       qdrant:
         condition: service_healthy
@@ -141,47 +143,67 @@ services:
           cpus: '1'
           memory: 2G
 
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: wikimind-prometheus
-    ports:
-      - "9090:9090"
-    volumes:
-      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    restart: unless-stopped
-    command:
-      - '--config.file=/etc/prometheus/prometheus.yml'
-      - '--storage.tsdb.path=/prometheus'
-    deploy:
-      resources:
-        limits:
-          cpus: '1'
-          memory: 2G
+  # -------------------------------------------------------------------------
+  # Langfuse (Self-Hosted LLM Observability)
+  # -------------------------------------------------------------------------
 
-  grafana:
-    image: grafana/grafana:latest
-    container_name: wikimind-grafana
+  langfuse:
+    image: langfuse/langfuse:2
+    container_name: wikimind-langfuse
     ports:
       - "3000:3000"
     environment:
-      - GF_SECURITY_ADMIN_PASSWORD=admin
-      - GF_USERS_ALLOW_SIGN_UP=false
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
-      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards
+      - DATABASE_URL=postgresql://langfuse:langfuse@langfuse-db:5432/langfuse
+      - NEXTAUTH_URL=http://localhost:3000
+      - NEXTAUTH_SECRET=wikimind-langfuse-secret-key-change-in-prod
+      - SALT=wikimind-salt-change-in-prod
+      - LANGFUSE_INIT_ORG_ID=wikimind
+      - LANGFUSE_INIT_ORG_NAME=WikiMind
+      - LANGFUSE_INIT_PROJECT_ID=wikimind-rag
+      - LANGFUSE_INIT_PROJECT_NAME=WikiMind RAG Pipeline
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=pk-lf-wikimind-dev
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=sk-lf-wikimind-dev
+      - LANGFUSE_INIT_USER_EMAIL=admin@wikimind.local
+      - LANGFUSE_INIT_USER_NAME=Admin
+      - LANGFUSE_INIT_USER_PASSWORD=wikimind-admin
     depends_on:
-      - prometheus
+      langfuse-db:
+        condition: service_healthy
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/api/public/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
     deploy:
       resources:
         limits:
           cpus: '1'
           memory: 1G
 
+  langfuse-db:
+    image: postgres:15-alpine
+    container_name: wikimind-langfuse-db
+    environment:
+      - POSTGRES_USER=langfuse
+      - POSTGRES_PASSWORD=langfuse
+      - POSTGRES_DB=langfuse
+    volumes:
+      - langfuse_db_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+
 volumes:
   qdrant_data:
   redis_data:
-  prometheus_data:
-  grafana_data:
+  langfuse_db_data:
