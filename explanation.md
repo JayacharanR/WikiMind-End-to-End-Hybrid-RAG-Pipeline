@@ -16,8 +16,11 @@ encountering the project for the first time.
 6. [Knowledge Graph Layer](#knowledge-graph-layer)
 7. [Temporal Versioning and Time-Travel](#temporal-versioning-and-time-travel)
 8. [Evaluation Harness](#evaluation-harness)
-9. [Architecture Diagrams](#architecture-diagrams)
-10. [Key Technical Decisions](#key-technical-decisions)
+9. [Observability (Langfuse)](#observability-langfuse)
+10. [Custom Observability Dashboard](#custom-observability-dashboard)
+11. [Architecture Diagrams](#architecture-diagrams)
+12. [Benchmark Results](#benchmark-results)
+13. [Key Technical Decisions](#key-technical-decisions)
 
 ---
 
@@ -119,8 +122,16 @@ two separate collections:
 A separate script (`data_pipeline/graph_builder.py`) scrolls through all
 chunks in Qdrant, reads the pre-extracted entities, and builds a NetworkX
 co-occurrence graph. If "Albert Einstein" and "Theory of Relativity" appear in
-the same chunk, they get connected with an edge. This graph is serialized and
-stored in Redis.
+the same chunk, they get connected with an edge.
+
+The graph uses **dual persistence** with automatic fallback:
+
+1. **Primary**: Serialized to a local JSON file at `data/knowledge_graph.json`.
+2. **Secondary**: Saved to Redis for fast runtime access (if available).
+
+At load time, the system tries Redis first, then falls back to the local JSON
+file. This means the knowledge graph works without Redis running, which is
+important for local development and environments where Docker is unavailable.
 
 ### What You Actually Need to Run
 
@@ -249,29 +260,81 @@ If no documents pass grading, the pipeline falls back to generating from
 whatever web snippets are available or returns a "no relevant information found"
 response.
 
-### 8. LLM Generation with Guardrails
+### 8. LLM Generation with Guardrails + Inline Citations
 
-The relevant chunks are formatted into a context block and passed to the LLM
-with a generation prompt. NeMo Guardrails wraps this call to enforce:
+The relevant chunks are formatted with **numbered citation labels** (`[1]`,
+`[2]`, etc.) and passed to the LLM with a generation prompt that requires
+inline citations after each factual claim.
 
+Generation uses a **guardrails-first** approach:
+
+1. **Try NeMo Guardrails** via `safe_generate()` — routes the prompt through
+   jailbreak detection, topic filtering, and output safety checks.
+2. **Fallback to direct LLM** — if guardrails aren't initialized (missing
+   config, NeMo not installed, or local LLM not running), the system
+   transparently falls back to a direct LLM call with the same citation
+   prompt. No errors are raised.
+
+The guardrails enforce:
 - Input safety rails (block harmful/adversarial queries).
 - Output safety rails (block toxic or personally identifiable content).
 - Topic rails (keep responses grounded in the retrieved context).
 
-### 9. Hallucination Check
+A `guardrails_applied` flag in the response metadata indicates which path
+was used.
 
-After generation, a separate LLM call checks: "Is this answer supported by the
-retrieved documents, or did the model make up facts?" If the answer is flagged
-as hallucinated, the system retries generation with the same context (up to 2
-retries). Each retry uses a different temperature to encourage a different
-phrasing.
+### 9. Hallucination Check + Citation Verification
 
-### 10. Answer Quality Check
+After generation, a **two-phase** check runs:
 
-If the answer passes the hallucination check, another LLM call evaluates:
-"Does this answer actually address the user's question?" If the answer is
-deemed off-topic or incomplete, the system loops all the way back to Step 2
-(query expansion) and tries a different expansion strategy (up to 2 retries).
+**Phase 1 — LLM grounding check** (relaxed criteria for local LLMs):
+
+- **Paraphrasing allowed**: The answer doesn't need to quote the context
+  verbatim. Reasonable paraphrasing and summarization are accepted.
+- **"Cannot answer" shortcut**: If the generation explicitly says it cannot
+  answer, the hallucination check is skipped entirely (it's grounded by
+  definition).
+- **Tolerant parsing**: The checker extracts the first word of the LLM response
+  for robust yes/no detection.
+- **Single retry**: If flagged as hallucinated, the system retries once.
+
+**Phase 2 — Citation verification** (provenance proof):
+
+- Parses all `[N]` inline citations from the generation text.
+- For each cited sentence, extracts key terms (words > 3 chars, excluding
+  stopwords) and checks if ≥40% of them appear in the referenced chunk.
+- Computes a **`provenance_score`** (0.0–1.0): the fraction of cited claims
+  whose key terms were verified against the source chunk.
+- A score of 0.0 means no citations were found (the LLM didn't cite).
+- A score of 1.0 means every citation checked out.
+
+This is the project's **provenance proof mechanism** — it provides a
+quantitative measure of how well the LLM's claims are traceable to specific
+retrieved chunks.
+
+### 10. Answer Quality Check + Attribution Detection
+
+If the answer passes the hallucination check, two things happen:
+
+**Quality check** (with heuristic bypass):
+- If the generation is non-trivial (≥10 words) and doesn't refuse to answer,
+  the LLM quality check is skipped entirely.
+- Short or ambiguous answers go through the LLM quality checker.
+
+**Attribution detection** (context-ablation):
+- A separate LLM call asks: _"Can you answer this question WITHOUT any external
+  context, from your training data alone?"_
+- If the LLM says "yes" → the answer may come from **parametric knowledge**
+  rather than RAG → `attribution = "parametric_risk"`
+- If the LLM says "no" → the answer likely required the RAG context →
+  `attribution = "rag_grounded"`
+
+This is a heuristic, not a guarantee — but it provides a signal that helps
+evaluate whether the RAG pipeline is actually contributing to the answer or
+whether the LLM could have answered alone.
+
+These tuning changes reduced the **mean step count from 16 to 7** and **P50
+latency from 8.9s to 4.7s** without sacrificing accuracy.
 
 ### 11. Cache and Return
 
@@ -301,8 +364,12 @@ State = {
     hallucination_grade:  "grounded" or "hallucinated"
     answer_grade:         "useful" or "not_useful"
     steps:                Total node transitions (hard budget: 15)
-    hallucination_retries: Independent counter (max 2)
-    answer_retries:       Independent counter (max 2)
+    hallucination_retries: Independent counter (max 1)
+    answer_retries:       Independent counter (max 1)
+    citation_map:         {1: chunk_dict, 2: chunk_dict, ...}
+    provenance_score:     0.0–1.0, fraction of cited claims verified
+    attribution:          "rag_grounded", "parametric_risk", or "unknown"
+    guardrails_applied:   Whether NeMo Guardrails were used for generation
 }
 ```
 
@@ -313,9 +380,9 @@ expand_query -> identify_articles -> [knowledge_graph?] -> retrieve
     -> grade_documents
         -> [irrelevant] -> generate_from_web -> END
         -> [relevant] -> generate -> check_hallucination
-            -> [hallucinated, retries < 2] -> generate (retry)
+            -> [hallucinated, retries < 1] -> generate (retry)
             -> [grounded] -> check_answer_quality
-                -> [not useful, retries < 2] -> expand_query (loop back)
+                -> [not useful, retries < 1] -> expand_query (loop back)
                 -> [useful or budget exhausted] -> END
 ```
 
@@ -371,7 +438,8 @@ how it works:
      metadata recording the source article title and chunk index.
    - Edge **weights** increase when two entities co-occur in multiple chunks.
 
-3. The graph is serialized to JSON and stored in Redis for fast access.
+3. The graph is serialized to a local JSON file (`data/knowledge_graph.json`)
+   and optionally mirrored to Redis for fast runtime access.
 
 ### Using the Graph at Query Time
 
@@ -449,7 +517,157 @@ python -m evaluation.harness --dataset triviaqa --subset 100 \
 ```
 
 Results are saved as both a markdown report and a JSON dump in
-`evaluation/results/`.
+`evaluation/results/`. If Langfuse is running, aggregate scores (recall, MRR,
+accuracy, latency, step count) are also pushed as Langfuse evaluation traces
+for dashboard tracking across benchmark runs.
+
+---
+
+## Observability (Langfuse)
+
+WikiMind uses a **Langfuse-first** observability strategy, purpose-built for
+LLM/RAG pipeline monitoring. This replaces the original Prometheus + Grafana
+stack, which was designed for generic infrastructure metrics and added
+maintenance overhead without capturing what matters for a RAG pipeline.
+
+### Why Langfuse Instead of Prometheus + Grafana?
+
+| Concern | Langfuse | Prometheus + Grafana |
+|---------|----------|---------------------|
+| **LLM trace waterfalls** | ✅ Built-in | ❌ Not possible |
+| **Token cost tracking** | ✅ Per-trace | ❌ Not possible |
+| **Evaluation scores** | ✅ Native integration | ❌ Requires custom exporters |
+| **Prompt versioning** | ✅ Built-in | ❌ Not possible |
+| **HTTP request rates** | ❌ Use Prometheus `/metrics` | ✅ Built-in |
+| **Dashboards to maintain** | 1 (auto-generated) | 2+ (custom build required) |
+
+For a RAG portfolio project, Langfuse captures what interviewers want to see:
+the full trace of how a query flows through expand → retrieve → grade →
+generate → hallucination check, with per-node latency and token counts.
+
+### Self-Hosted Deployment
+
+Langfuse runs via `docker-compose.yml` alongside the existing services:
+
+- **`langfuse`**: The Langfuse server (langfuse/langfuse:2), accessible at
+  `http://localhost:3000`.
+- **`langfuse-db`**: PostgreSQL 15 Alpine for Langfuse's metadata storage.
+
+The docker-compose auto-seeds a project with pre-configured API keys via
+`LANGFUSE_INIT_*` environment variables, so no manual setup is needed.
+
+Login: `admin@wikimind.local` / `wikimind-admin`
+
+### What Gets Traced
+
+Every query through the `/chat` or `/chat/compare` endpoint creates a Langfuse
+trace with:
+
+```
+Trace: wikimind_query
+├─ expand_query        (12ms, 0 tokens)
+├─ identify_articles   (268ms, 0 tokens)
+├─ retrieve            (830ms, 0 tokens)
+├─ grade_documents     (1,427ms, 142 tokens)
+├─ generate            (937ms, 312 tokens)
+├─ check_hallucination (1,113ms, 48 tokens)
+└─ check_answer_quality (0ms, heuristic bypass)
+
+Total: 4.7s | 502 tokens | Score: grounded ✓
+```
+
+The evaluation harness also pushes benchmark aggregate scores to Langfuse,
+enabling comparison across runs.
+
+### Prometheus (Retained, No Dashboards)
+
+The `prometheus-fastapi-instrumentator` is kept (2 lines of code in `main.py`).
+It exposes standard HTTP metrics at `/metrics` for production environments that
+require Grafana/Datadog integration. No Grafana dashboards are bundled since
+Langfuse handles all RAG-specific observability.
+
+---
+
+## Custom Observability Dashboard
+
+While Langfuse provides deep LLM trace analysis, WikiMind also includes a
+custom-built observability dashboard served directly from the FastAPI backend.
+This provides an at-a-glance operational view without requiring Langfuse access.
+
+### Architecture
+
+The dashboard is a multi-file vanilla HTML/CSS/JS application (no build tools)
+served as static files at `/dashboard` via FastAPI's `StaticFiles` mount:
+
+```
+dashboard/
+├── index.html          # Entry point with 5-tab layout
+├── css/
+│   └── dashboard.css   # Design system (dark/light mode, glassmorphism)
+└── js/
+    ├── app.js          # Tab routing, state management, auto-refresh
+    ├── api.js          # Fetch wrappers for backend endpoints
+    ├── charts.js       # Chart.js factories (line, doughnut, bar)
+    ├── kpi.js          # KPI card rendering (6 metrics)
+    ├── traces.js       # Trace table with expandable detail rows
+    ├── guardrails.js   # Guardrails monitoring panel
+    └── evaluation.js   # Benchmark results viewer
+```
+
+### Backend Data Layer
+
+The dashboard reads from three backend API endpoints:
+
+- **`GET /api/metrics`** — Aggregated KPIs computed from an in-memory ring
+  buffer of the last 500 query traces. Returns latency percentiles (P50, P95),
+  attribution breakdown, guardrails stats, grade counts, and cache hit rate.
+
+- **`GET /api/traces`** — Raw trace objects for the trace explorer. Each trace
+  contains the query, generation, latency, step count, provenance score,
+  attribution, grade results, expanded queries, and citation map.
+
+- **`GET /api/eval-results`** — Evaluation benchmark results read from
+  `evaluation/results/*.json` on disk.
+
+### Dashboard Tabs
+
+1. **Overview** — 6 KPI cards (total queries, P50 latency, avg steps,
+   provenance score, RAG grounded %, guardrails applied). Latency timeline
+   chart (Chart.js line), attribution donut chart, recent queries table.
+   Auto-refreshes every 30 seconds.
+
+2. **Traces** — Full query trace table with expandable rows. Each expanded row
+   shows: query text, generation text, metadata grid (latency, steps, documents,
+   provenance), attribution and grade badges, expanded queries list, and
+   citation map. Color-coded latency (green < 3s, amber < 8s, red > 8s).
+
+3. **Guardrails** — Applied vs bypassed donut chart, quality grade breakdown
+   (grounded/hallucinated/useful/not useful as horizontal bars), and a safety
+   event log table listing guardrail-related or quality-flagged queries.
+
+4. **Evaluation** — Benchmark results viewer. Shows aggregate metrics
+   (Recall@5, MRR, Accuracy, Latency P50, Mean Steps) and a per-query table
+   for each evaluation run.
+
+5. **System** — Component health from the `/health` endpoint. Displays
+   Qdrant, Redis, LLM, and Langfuse status with latency indicators.
+
+### Design System
+
+- **Dark mode default** with light mode toggle (matches the existing Streamlit
+  chat UI aesthetic).
+- **Typography**: Inter (body) + JetBrains Mono (metrics/code) via Google Fonts.
+- **Visualization**: Chart.js 4.x for all charts.
+- **Icons**: Lucide icon library.
+- **No build tools**: Pure ES modules, served as static files.
+
+### Why a Custom Dashboard Instead of Grafana?
+
+Grafana is designed for infrastructure metrics (CPU, memory, request rates).
+A custom dashboard can display RAG-specific information that Grafana can't:
+provenance scores, attribution breakdown, citation maps, expanded queries,
+and quality grades. For a portfolio project, a purpose-built dashboard
+demonstrates architectural understanding far better than generic charts.
 
 ---
 
@@ -511,13 +729,14 @@ Results are saved as both a markdown report and a JSON dump in
 |  [LLM Generation + NeMo Guardrails]                           |
 |       |                                                       |
 |       v                                                       |
-|  [Hallucination Check] ---fail (max 2)--> retry generation    |
-|       |                                                       |
+|  [Hallucination Check] ---fail (max 1)--> retry generation    |
+|       |                 (relaxed grounding + tolerant parsing) |
 |       v (pass)                                                |
-|  [Answer Quality Check] ---fail (max 2)--> loop to expansion  |
-|       |                                                       |
+|  [Answer Quality Check] ---fail (max 1)--> loop to expansion  |
+|       |                 (heuristic bypass for non-trivial)     |
 |       v (pass)                                                |
 |  [Cache Store + Return Answer via SSE]                        |
+|  [Langfuse Trace Recorded]                                    |
 +==============================================================+
 ```
 
@@ -549,16 +768,69 @@ Results are saved as both a markdown report and a JSON dump in
        |                                                  |      |
        |                                           hallucinated  grounded
        |                                                  |      |
-       |                                            (retry, <=2) |
+       |                                            (retry, <=1) |
        |                                                  |      |
        |                                          +-------v------v--+
        |                                          | check_answer    |
+       |                                          | (heuristic      |
+       |                                          |  bypass if >=10 |
+       |                                          |  words)         |
        |                                          +--+----------+---+
        |                                             |          |
        |                                        not_useful    useful
        |                                             |          |
-       +---------(loop back, retries <= 2)-----------+         END
+       |                                             |         END
+       +---------(loop back, retries <= 1)-----------+   |
 ```
+
+---
+
+## Benchmark Results
+
+The evaluation harness has been executed against a 10-question curated Wikipedia
+Q&A dataset. Two configurations were tested: **baseline** (no expansion) and
+**with_expansion** (multi-query + step-back).
+
+### Baseline vs Expansion (Before Hallucination Tuning)
+
+| Metric | Baseline | With Expansion | Delta |
+|--------|----------|---------------|-------|
+| Mean Recall@5 | 0.9000 | 0.9000 | — |
+| Mean MRR | 0.6833 | **0.7250** | **+6.1%** |
+| Mean Answer Accuracy | 0.8000 | 0.8000 | — |
+| Latency P50 | **8.94s** | 17.92s | +100% |
+| Mean Step Count | 16.0 | 16.0 | — |
+
+Expansion improved MRR by 6.1% (better ranking) at the cost of doubled latency.
+Both configs exhausted the 16-step budget on every query due to the overly
+aggressive hallucination checker.
+
+### Impact of Hallucination Checker Tuning
+
+| Metric | Before Tuning | After Tuning | Improvement |
+|--------|:---:|:---:|:---:|
+| Mean Recall@5 | 0.90 | 0.90 | — |
+| Mean Answer Accuracy | 0.80 | 0.80 | — |
+| **Latency P50** | 8.94s | **4.72s** | **↓ 47%** |
+| **Mean Step Count** | 16.0 | **7.0** | **↓ 56%** |
+
+Quality stayed identical, but latency nearly halved and step count dropped from
+16 to 7. The three changes that had the biggest impact:
+
+1. **Heuristic answer quality bypass** — saves 1 LLM call per query.
+2. **"Cannot answer" shortcut** — no wasted retries on refusal responses.
+3. **Retry limit reduction (2→1)** — worst case is now 7 steps, not 16.
+
+### Knowledge Graph Statistics
+
+Built from 5,000 Qdrant chunks in 167.7 seconds:
+
+| Metric | Value |
+|--------|-------|
+| Nodes (entities) | 18,010 |
+| Edges (co-occurrences) | 71,491 |
+| Top entity by degree | "the United States" (425 connections) |
+| Storage | `data/knowledge_graph.json` |
 
 ---
 
@@ -610,6 +882,55 @@ wrong). An answer quality retry re-expands and re-retrieves (the answer was
 factually correct but did not address the question). Using a shared counter
 caused one check type to consume the other's retry budget.
 
+### Why Reduced Retry Limits (2 → 1)?
+
+Benchmarking revealed that with a local 8B-parameter LLM, the hallucination and
+answer quality checkers were producing false negatives on most queries, causing
+the pipeline to exhaust its 16-step budget on every single query. Reducing from
+2 retries to 1, combined with relaxed grounding criteria and heuristic bypasses,
+cut step count from 16 to 7 without any loss in answer accuracy.
+
+### Why Langfuse Instead of Prometheus + Grafana?
+
+Prometheus + Grafana is designed for infrastructure metrics (request rates,
+error counts, CPU usage). Langfuse is purpose-built for LLM observability
+(trace waterfalls, token costs, evaluation scores, prompt versioning).
+Maintaining three dashboards for what one tool does better was unnecessary
+complexity. The Prometheus `/metrics` endpoint is retained (2 lines of code)
+for production environments that need infrastructure monitoring.
+
+### Why Citation-Based Provenance Instead of Chunk ID Injection?
+
+Alternative approaches like injecting chunk UUIDs into the prompt or
+post-processing with embedding similarity are either fragile (UUIDs get
+hallucinated) or expensive (recomputing embeddings per sentence). The inline
+`[N]` citation approach works because:
+
+1. **LLMs are trained on academic text** — they understand `[N]` citation
+   conventions and follow the instruction reliably.
+2. **Verification is cheap** — parsing `[N]` with regex and checking key term
+   overlap against chunks requires zero LLM calls.
+3. **User-visible** — citations appear in the response, so users can click
+   through to the source chunk. This doubles as a UX feature.
+
+The `provenance_score` (0.0–1.0) provides a quantitative trust signal per
+response, not just per-query accuracy.
+
+### Why Context-Ablation for Attribution?
+
+The fundamental question is: "Did the RAG pipeline contribute to this answer,
+or did the LLM already know the answer?" There are three approaches:
+
+1. **Use a weak model** — deliberately use an LLM that can't answer without
+   context. But this sacrifices generation quality.
+2. **Constrained decoding** — force the LLM to only output tokens from the
+   context. But this breaks fluency and summarization.
+3. **Context-ablation** — ask the LLM if it *could* answer without context.
+
+Option 3 adds ~1 LLM call per query but doesn't sacrifice quality. The
+`attribution` field is informational (`"rag_grounded"` vs `"parametric_risk"`)
+rather than a blocker — it flags answers that might need human review.
+
 ### Why Store is_current Instead of Deleting Old Chunks?
 
 Deleting old chunks is irreversible. By marking them `is_current=false`, we
@@ -626,7 +947,8 @@ needed for retrieval -- FastEmbed generates all embeddings locally on CPU.
 
 The only external API requirement is an LLM for the generation, grading, and
 expansion steps. This uses the OpenAI-compatible API configured via the
-`OPENROUTER_API_KEY` environment variable.
+`OPENROUTER_API_KEY` environment variable (or a local Llama server on port
+8080).
 
 ### Ingestion Commands
 
@@ -644,7 +966,7 @@ python -m data_pipeline.ingest --max 0
 python -m data_pipeline.ingest --articles-only
 
 # Build the knowledge graph from existing chunks
-python -m data_pipeline.graph_builder
+python -m data_pipeline.graph_builder --scroll-limit 5000
 ```
 
 ### Infrastructure
@@ -652,13 +974,24 @@ python -m data_pipeline.graph_builder
 All infrastructure runs in Docker:
 
 ```bash
-make dev   # Starts Qdrant, Redis, Prometheus, Grafana, Backend, Frontend
+docker compose up -d  # Starts Qdrant, Redis, Langfuse, Backend, Frontend
 ```
 
 Or individually:
 
 ```bash
-docker compose up qdrant redis -d       # Just the databases
-uvicorn backend.main:app --reload       # Backend
-streamlit run frontend/app.py           # Frontend
+docker compose up qdrant redis langfuse langfuse-db -d  # Databases + observability
+uvicorn backend.main:app --reload                       # Backend
+streamlit run frontend/app.py                           # Frontend
 ```
+
+### Access Points
+
+| Service | URL | Notes |
+|---------|-----|-------|
+| **Frontend** | http://localhost:8501 | Streamlit chat UI |
+| **Backend API** | http://localhost:8000 | FastAPI + Swagger at `/docs` |
+| **Observability Dashboard** | http://localhost:8000/dashboard/ | Custom 5-tab dashboard |
+| **Langfuse** | http://localhost:3000 | LLM traces and eval dashboard |
+| **Qdrant** | http://localhost:6333 | Vector DB dashboard |
+| **Prometheus Metrics** | http://localhost:8000/metrics | Raw endpoint, no dashboard |

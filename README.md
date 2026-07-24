@@ -61,8 +61,10 @@ graph TD
 | **Query Expansion** | Parallel strategies: Multi-Query, HyDE, Step-Back Abstraction, Query Decomposition | LangChain, OpenAI |
 | **Evaluation Harness** | Automated benchmarking with Recall@K, MRR, Answer Accuracy, and latency percentiles against NQ and TriviaQA | HuggingFace Datasets |
 | **A/B Dashboard** | Side-by-side strategy comparison (single-query and batch CSV) with metrics visualization | Streamlit |
-| **Safe Generation** | NeMo Guardrails for hallucination detection and output safety | NeMo Guardrails |
-| **Full Observability** | Distributed tracing, hardware metrics, and LLM telemetry | Langfuse, Prometheus, Grafana |
+| **Safe Generation** | NeMo Guardrails for jailbreak detection, topic filtering, and output safety — wired into generation with automatic fallback | NeMo Guardrails |
+| **RAG Provenance** | Inline `[N]` citations with key-term overlap verification. Produces a `provenance_score` (0.0–1.0) per query | Custom |
+| **Attribution Detection** | Context-ablation LLM call to distinguish RAG-grounded answers from LLM parametric knowledge | Custom |
+| **Full Observability** | Self-hosted Langfuse for LLM traces + custom 5-tab dashboard for KPIs, guardrails, and evaluation results | Langfuse, Chart.js |
 
 ## Project Structure
 
@@ -98,7 +100,11 @@ wikimind/
 |   +-- pages/
 |       |-- ab_dashboard.py   # A/B strategy comparison
 |       +-- eval_results.py   # Evaluation results browser
-|-- monitoring/               # Prometheus and Grafana configuration
+|-- monitoring/               # Observability strategy documentation
+|-- dashboard/
+|   |-- index.html            # Custom observability dashboard (5 tabs)
+|   |-- css/dashboard.css     # Design system (dark/light mode)
+|   +-- js/                   # Modular ES modules (app, api, charts, traces, etc.)
 |-- docker-compose.yml
 |-- pyproject.toml
 +-- Makefile
@@ -131,9 +137,10 @@ wikimind/
    ```
 
 4. Access the application:
-   - Streamlit UI: `http://localhost:8501`
-   - FastAPI Docs: `http://localhost:8000/docs`
-   - Grafana: `http://localhost:3000` (admin/admin)
+    - Streamlit UI: `http://localhost:8501`
+    - FastAPI Docs: `http://localhost:8000/docs`
+    - Observability Dashboard: `http://localhost:8000/dashboard/`
+    - Langfuse: `http://localhost:3000` (admin@wikimind.local / wikimind-admin)
 
 ### Build the Knowledge Graph
 
@@ -191,6 +198,18 @@ Runs a query through multiple strategy configurations for A/B comparison.
 
 Returns the status and latency of infrastructure components (Qdrant, Redis, Langfuse).
 
+### `GET /api/metrics`
+
+Returns aggregated dashboard metrics from the in-memory trace log (KPIs, attribution breakdown, guardrails stats, grade counts).
+
+### `GET /api/traces?limit=100`
+
+Returns the last N query traces with full detail for the dashboard trace explorer.
+
+### `GET /api/eval-results`
+
+Returns evaluation benchmark results from `evaluation/results/`.
+
 ## Tech Stack
 
 | Category | Technologies |
@@ -202,7 +221,7 @@ Returns the status and latency of infrastructure components (Qdrant, Redis, Lang
 | **Reranking** | FlashRank (cross-encoder) |
 | **Caching** | Redis (semantic cache + KG persistence) |
 | **Guardrails** | NeMo Guardrails |
-| **Observability** | Langfuse, Prometheus, Grafana |
+| **Observability** | Langfuse (self-hosted), Custom Dashboard (Chart.js) |
 | **Web Framework** | FastAPI, Streamlit |
 | **Data Pipeline** | HuggingFace Datasets, aiohttp, MediaWiki API |
 | **Evaluation** | Custom harness with NQ/TriviaQA datasets |

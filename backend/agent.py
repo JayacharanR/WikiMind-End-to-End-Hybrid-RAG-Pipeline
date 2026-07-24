@@ -10,6 +10,7 @@ step budget.
 
 import json
 import logging
+import re as _re
 from typing import Dict, List, Literal, TypedDict
 from urllib.parse import unquote, urlparse
 from langchain_core.prompts import ChatPromptTemplate
@@ -46,6 +47,11 @@ class AgentState(TypedDict):
     hallucination_retries: int
     answer_retries: int
     as_of_date: str
+    # --- Provenance & Attribution (added) ---
+    citation_map: Dict          # {1: chunk_dict, 2: chunk_dict, ...}
+    provenance_score: float     # 0.0–1.0, fraction of cited claims verified
+    attribution: str            # "rag_grounded", "parametric_risk", or "unknown"
+    guardrails_applied: bool    # whether NeMo Guardrails were used for generation
 
 
 # ---------------------------------------------------------------------------
@@ -290,6 +296,63 @@ async def node_grade_documents(state: AgentState) -> Dict:
         return {"documents": documents, "retrieval_grade": "relevant", "steps": steps}
 
 
+def _build_cited_context(documents: List[Dict]) -> tuple:
+    """Format documents with numbered citation labels and build a citation map.
+
+    Returns:
+        (context_str, citation_map) where context_str has [1], [2], etc.
+        labels and citation_map maps number -> chunk dict.
+    """
+    citation_map = {}
+    parts = []
+    for i, doc in enumerate(documents, start=1):
+        citation_map[i] = {
+            "title": doc.get("title", "Unknown"),
+            "url": doc.get("url", ""),
+            "content_preview": doc.get("content", "")[:300],
+        }
+        parts.append(
+            f"[{i}] Title: {doc.get('title', 'Unknown')}\n"
+            f"URL: {doc.get('url', 'N/A')}\n"
+            f"Content: {doc.get('content', '')}"
+        )
+    return "\n\n".join(parts), citation_map
+
+
+_CITATION_SYSTEM_PROMPT = (
+    "You are a strict, factual Wikipedia-grounded assistant. Answer the user's "
+    "question using ONLY the provided numbered context chunks.\n\n"
+    "CITATION RULES:\n"
+    "- After each factual claim, add the source number in square brackets, "
+    "e.g. 'Paris is the capital of France [1].'\n"
+    "- You may cite multiple sources: 'The population is 14 million [1][3].'\n"
+    "- If the context does not contain the answer, say exactly: "
+    "'I cannot answer this based on the retrieved context.'\n\n"
+    "Context:\n{context}"
+)
+
+_CITATION_USER_PROMPT = (
+    "Question: {query}\n\n"
+    "CRITICAL: Answer in plain English with inline [N] citations. "
+    "DO NOT output JSON or function calls."
+)
+
+
+async def _direct_llm_generate(query: str, context: str) -> str:
+    """Generate via direct LLM call (fallback when guardrails unavailable)."""
+    llm = _get_llm(temperature=0.0, max_tokens=500)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", _CITATION_SYSTEM_PROMPT),
+        ("user", _CITATION_USER_PROMPT),
+    ])
+    try:
+        res = await (prompt | llm).ainvoke({"context": context, "query": query})
+        return str(res.content)
+    except Exception as exc:
+        logger.warning("Direct LLM generation failed: %s", exc)
+        return "Error generating response."
+
+
 async def node_generate_from_web(state: AgentState) -> Dict:
     """Node: Generate a response using fallback context.
 
@@ -304,85 +367,140 @@ async def node_generate_from_web(state: AgentState) -> Dict:
     logger.info("--- NODE: GENERATE FALLBACK (step %d) ---", steps)
 
     if web_snippets:
-        context = "\n\n".join(
-            f"Title: {d.get('title')}\nURL: {d.get('url', 'N/A')}\nContent: {d.get('content')}"
-            for d in web_snippets
-        )
+        context, citation_map = _build_cited_context(web_snippets)
     else:
         context = "No relevant context was found."
+        citation_map = {}
 
-    llm = _get_llm(temperature=0.0, max_tokens=500)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", 
-         "You are an intelligent Wikipedia-grounded assistant. Answer the user's question using ONLY the provided context chunks.\n"
-         "If the context does not contain the answer, you MUST say exactly: 'I cannot answer this based on the retrieved context.'\n"
-         "Context:\n{context}"),
-        ("user", 
-         "Question: {query}\n\n"
-         "CRITICAL: Answer directly in plain English sentences. DO NOT output JSON. DO NOT output function calls. Write your answer below:")
-    ])
-    
-    try:
-        res = await (prompt | llm).ainvoke({"context": context, "query": query})
-        generation = str(res.content)
-    except Exception as exc:
-        generation = "Error generating fallback response."
-        
-    return {"generation": generation, "documents": web_snippets, "steps": steps}
+    generation = await _direct_llm_generate(query, context)
+
+    return {
+        "generation": generation,
+        "documents": web_snippets,
+        "citation_map": citation_map,
+        "steps": steps,
+    }
 
 
 async def node_generate(state: AgentState) -> Dict:
-    """Node: Generate response using NeMo Guardrails with retrieved context."""
+    """Node: Generate response with inline citations.
+
+    Tries NeMo Guardrails first via safe_generate(). If guardrails are
+    unavailable or return an error, falls back to direct LLM generation.
+    Both paths use the citation-numbered context format.
+    """
     query = state["query"]
     documents = state.get("documents", [])
     steps = state.get("steps", 0) + 1
 
     logger.info("--- NODE: GENERATE (step %d) ---", steps)
 
-    context = "\n\n".join(
-        f"Title: {d.get('title')}\nURL: {d.get('url', 'N/A')}\nContent: {d.get('content')}"
-        for d in documents
-    )
+    context, citation_map = _build_cited_context(documents)
+    guardrails_applied = False
 
-    llm = _get_llm(temperature=0.0, max_tokens=500)
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", 
-         "You are a strict, factual Wikipedia-grounded assistant. Answer the user's question using ONLY the provided context chunks.\n"
-         "If the context does not explicitly contain the answer, you MUST say exactly: 'I cannot answer this based on the retrieved context.'\n"
-         "Context:\n{context}"),
-        ("user", 
-         "Question: {query}\n\n"
-         "CRITICAL: Answer directly in plain English sentences. DO NOT output JSON. DO NOT output function calls. Write your answer below:")
-    ])
-    
+    # --- Try NeMo Guardrails first ---
     try:
-        res = await (prompt | llm).ainvoke({"context": context, "query": query})
-        generation = str(res.content)
+        generation = await safe_generate(query=query, context=context)
+        if generation and "Error:" not in generation and "not initialized" not in generation:
+            guardrails_applied = True
+            logger.info("Generation via NeMo Guardrails succeeded.")
+        else:
+            raise RuntimeError("Guardrails returned error or unavailable")
     except Exception as exc:
-        generation = "Error generating response."
+        logger.info("Guardrails unavailable (%s). Falling back to direct LLM.", exc)
+        generation = await _direct_llm_generate(query, context)
 
-    return {"generation": generation, "steps": steps}
+    return {
+        "generation": generation,
+        "citation_map": citation_map,
+        "guardrails_applied": guardrails_applied,
+        "steps": steps,
+    }
+
+
+def _verify_citations(generation: str, citation_map: Dict, documents: List[Dict]) -> float:
+    """Verify inline [N] citations against source chunks.
+
+    Splits the generation into sentences, finds cited references, and checks
+    if key terms from the sentence appear in the referenced chunk content.
+
+    Returns:
+        provenance_score: fraction of cited sentences whose key terms appear
+        in the referenced chunk (0.0–1.0). Returns 1.0 if no citations found
+        (nothing to verify).
+    """
+    # Find all sentences with citations
+    # Pattern: any text followed by [N] (possibly multiple)
+    cited_segments = _re.findall(r'([^.!?]+?)\s*(?:\[\d+\])+', generation)
+    citation_refs = _re.findall(r'\[(\d+)\]', generation)
+
+    if not citation_refs:
+        # No citations at all — can't verify
+        return 0.0
+
+    # Build a lookup from citation number to full content
+    content_by_num = {}
+    for i, doc in enumerate(documents, start=1):
+        content_by_num[i] = (doc.get("content", "") or "").lower()
+
+    verified = 0
+    total = 0
+
+    for segment in cited_segments:
+        # Find which citations this segment references
+        refs_in_segment = _re.findall(r'\[(\d+)\]', generation[generation.find(segment):])
+        if not refs_in_segment:
+            continue
+
+        # Extract key terms (words > 3 chars, not stopwords)
+        stopwords = {"the", "and", "was", "were", "that", "this", "with", "from",
+                     "for", "are", "but", "not", "you", "all", "can", "had",
+                     "her", "one", "our", "out", "has", "have", "been", "also"}
+        key_terms = [
+            w.lower() for w in _re.findall(r'\w+', segment)
+            if len(w) > 3 and w.lower() not in stopwords
+        ]
+
+        if not key_terms:
+            continue
+
+        total += 1
+
+        # Check if at least 40% of key terms appear in any referenced chunk
+        for ref_str in refs_in_segment[:3]:  # cap at 3 refs per segment
+            ref_num = int(ref_str)
+            chunk_text = content_by_num.get(ref_num, "")
+            if chunk_text:
+                matches = sum(1 for t in key_terms if t in chunk_text)
+                if matches / len(key_terms) >= 0.4:
+                    verified += 1
+                    break
+
+    return round(verified / total, 2) if total > 0 else 1.0
 
 
 async def node_check_hallucination(state: AgentState) -> Dict:
     """Node: Evaluate if the generation is grounded in the retrieved documents.
 
-    Uses a structured JSON prompt optimized for local LLMs (e.g., Llama 3.1 8B)
-    with relaxed grounding criteria that allows reasonable paraphrasing and
-    inference from the source documents.
+    Two-phase check:
+    1. LLM grounding check (relaxed criteria for local LLMs)
+    2. Citation verification — parses [N] references and checks if cited
+       claims actually appear in the referenced chunks.
     """
     documents = state.get("documents", [])
     generation = state["generation"]
+    citation_map = state.get("citation_map", {})
     steps = state.get("steps", 0) + 1
     retries = state.get("hallucination_retries", 0)
 
     logger.info("--- NODE: CHECK HALLUCINATION (step %d) ---", steps)
 
-    # If generation admits lack of knowledge, it's grounded by definition
+    # Phase 0: If generation admits lack of knowledge, it's grounded by definition
     if "cannot answer" in generation.lower() or "no relevant" in generation.lower():
         logger.info("Hallucination check skipped (generation admits no answer).")
-        return {"hallucination_grade": "grounded", "steps": steps}
+        return {"hallucination_grade": "grounded", "provenance_score": 1.0, "steps": steps}
 
+    # Phase 1: LLM grounding check
     llm = _get_llm(temperature=0.0, max_tokens=20)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -411,25 +529,59 @@ async def node_check_hallucination(state: AgentState) -> Dict:
     try:
         res = await chain.ainvoke({"documents": context, "generation": generation})
         raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
-        # Extract just the first word for robust parsing
         first_word = raw.split()[0] if raw.split() else ""
-
-        # Tolerant parsing: pass if "yes" is present OR "no" is NOT the first word
         is_grounded = "yes" in first_word or (first_word != "no" and "yes" in raw)
-
-        if is_grounded:
-            logger.info("Hallucination check passed (grounded). LLM said: '%s'", raw[:50])
-            return {"hallucination_grade": "grounded", "steps": steps}
-        else:
-            logger.warning("Hallucination check failed (not grounded). LLM said: '%s'. Retry %d.", raw[:50], retries + 1)
-            return {
-                "hallucination_grade": "hallucinated",
-                "steps": steps,
-                "hallucination_retries": retries + 1,
-            }
     except Exception as exc:
-        logger.warning("Hallucination check failed with error: %s. Passing through.", exc)
-        return {"hallucination_grade": "grounded", "steps": steps}
+        logger.warning("Hallucination LLM check failed: %s. Passing through.", exc)
+        is_grounded = True
+
+    # Phase 2: Citation verification (runs regardless of LLM grounding result)
+    provenance_score = _verify_citations(generation, citation_map, documents)
+    logger.info("Citation verification: provenance_score=%.2f", provenance_score)
+
+    if is_grounded:
+        logger.info("Hallucination check passed (grounded). LLM said: '%s'", raw[:50] if 'raw' in dir() else 'N/A')
+        return {"hallucination_grade": "grounded", "provenance_score": provenance_score, "steps": steps}
+    else:
+        logger.warning("Hallucination check failed (not grounded). LLM said: '%s'. Retry %d.", raw[:50], retries + 1)
+        return {
+            "hallucination_grade": "hallucinated",
+            "provenance_score": provenance_score,
+            "steps": steps,
+            "hallucination_retries": retries + 1,
+        }
+
+
+async def _check_attribution(query: str) -> str:
+    """Context-ablation check: can the LLM answer without any context?
+
+    If the LLM says 'yes', the answer may come from parametric knowledge
+    rather than the retrieved RAG context.
+
+    Returns:
+        'rag_grounded' or 'parametric_risk'
+    """
+    llm = _get_llm(temperature=0.0, max_tokens=10)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are a knowledge self-assessment module. Given a question, determine "
+         "if you could answer it correctly from your training data alone, WITHOUT "
+         "any external context or documents.\n\n"
+         "Answer 'yes' ONLY if you are confident you know the factual answer.\n"
+         "Answer 'no' if you would need external sources to answer correctly.\n\n"
+         "Respond with ONLY 'yes' or 'no'."),
+        ("user", "Question: {query}\n\nCan you answer this without external context? (yes/no):"),
+    ])
+
+    try:
+        res = await (prompt | llm).ainvoke({"query": query})
+        raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
+        first_word = raw.split()[0] if raw.split() else ""
+        if "yes" in first_word:
+            return "parametric_risk"
+        return "rag_grounded"
+    except Exception:
+        return "unknown"
 
 
 async def node_check_answer_quality(state: AgentState) -> Dict:
@@ -437,6 +589,7 @@ async def node_check_answer_quality(state: AgentState) -> Dict:
 
     Uses a structured prompt optimized for local LLMs with tolerant parsing
     that defaults to passing if the LLM output is ambiguous.
+    After quality passes, runs a context-ablation attribution check.
     """
     query = state["query"]
     generation = state["generation"]
@@ -445,53 +598,55 @@ async def node_check_answer_quality(state: AgentState) -> Dict:
 
     logger.info("--- NODE: CHECK ANSWER QUALITY (step %d) ---", steps)
 
-    # If the generation is non-trivial (more than a few words), it likely
-    # attempts to answer the question. Skip the LLM check for efficiency.
+    # Heuristic bypass: non-trivial responses skip the LLM quality check
+    is_useful = False
     if len(generation.split()) >= 10 and "cannot answer" not in generation.lower():
         logger.info("Answer quality check passed (heuristic: non-trivial response).")
-        return {"answer_grade": "useful", "steps": steps}
+        is_useful = True
+    else:
+        llm = _get_llm(temperature=0.0, max_tokens=20)
+        prompt = ChatPromptTemplate.from_messages([
+            ("system",
+             "You are an answer quality checker. Determine if the ANSWER attempts "
+             "to address the QUESTION, even if partially.\n\n"
+             "Rules:\n"
+             "- Answer 'yes' if the response provides any relevant information "
+             "about the question, even if incomplete.\n"
+             "- Answer 'no' ONLY if the response is completely off-topic, empty, "
+             "or explicitly refuses to answer.\n\n"
+             "Respond with ONLY the word 'yes' or 'no'."),
+            ("user",
+             "QUESTION: {query}\n\n"
+             "ANSWER: {generation}\n\n"
+             "Does the answer address the question? (yes/no):"),
+        ])
+        try:
+            res = await (prompt | llm).ainvoke({"query": query, "generation": generation})
+            raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
+            first_word = raw.split()[0] if raw.split() else ""
+            is_useful = "yes" in first_word or (first_word != "no" and "yes" in raw)
+        except Exception as exc:
+            logger.warning("Answer quality check failed: %s. Passing through.", exc)
+            is_useful = True
 
-    llm = _get_llm(temperature=0.0, max_tokens=20)
+    if not is_useful:
+        logger.warning("Answer quality failed (not useful). Retry %d.", retries + 1)
+        return {
+            "answer_grade": "not_useful",
+            "attribution": "unknown",
+            "steps": steps,
+            "answer_retries": retries + 1,
+        }
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "You are an answer quality checker. Determine if the ANSWER attempts "
-         "to address the QUESTION, even if partially.\n\n"
-         "Rules:\n"
-         "- Answer 'yes' if the response provides any relevant information "
-         "about the question, even if incomplete.\n"
-         "- Answer 'no' ONLY if the response is completely off-topic, empty, "
-         "or explicitly refuses to answer.\n\n"
-         "Respond with ONLY the word 'yes' or 'no'."),
-        ("user",
-         "QUESTION: {query}\n\n"
-         "ANSWER: {generation}\n\n"
-         "Does the answer address the question? (yes/no):"),
-    ])
+    # --- Attribution check (runs only when quality passes) ---
+    attribution = await _check_attribution(query)
+    logger.info("Attribution check: %s", attribution)
 
-    chain = prompt | llm
-
-    try:
-        res = await chain.ainvoke({"query": query, "generation": generation})
-        raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
-        first_word = raw.split()[0] if raw.split() else ""
-
-        # Tolerant parsing: pass if "yes" is present OR "no" is NOT the first word
-        is_useful = "yes" in first_word or (first_word != "no" and "yes" in raw)
-
-        if is_useful:
-            logger.info("Answer quality check passed (useful). LLM said: '%s'", raw[:50])
-            return {"answer_grade": "useful", "steps": steps}
-        else:
-            logger.warning("Answer quality check failed (not useful). LLM said: '%s'. Retry %d.", raw[:50], retries + 1)
-            return {
-                "answer_grade": "not_useful",
-                "steps": steps,
-                "answer_retries": retries + 1,
-            }
-    except Exception as exc:
-        logger.warning("Answer quality check failed with error: %s. Passing through.", exc)
-        return {"answer_grade": "useful", "steps": steps}
+    return {
+        "answer_grade": "useful",
+        "attribution": attribution,
+        "steps": steps,
+    }
 
 
 # ---------------------------------------------------------------------------

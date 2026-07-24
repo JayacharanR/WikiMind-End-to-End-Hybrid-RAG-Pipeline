@@ -80,6 +80,10 @@ async def _evaluate_single_query(
         "hallucination_retries": 0,
         "answer_retries": 0,
         "as_of_date": None,
+        "citation_map": {},
+        "provenance_score": 0.0,
+        "attribution": "unknown",
+        "guardrails_applied": False,
     }
 
     start_time = time.monotonic()

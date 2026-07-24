@@ -165,35 +165,37 @@ def get_guardrails() -> Optional[LLMRails]:
 
 
 @observe(as_type="generation")
-async def safe_generate(query: str, context: str = "") -> str:
+async def safe_generate(query: str, context: str = "") -> Optional[str]:
     """Apply NeMo Guardrails to the outgoing generation request.
 
     Evaluates the query against predefined safety and topical rails, then
     generates a response. The ``@observe`` decorator logs the full trace
     to Langfuse automatically.
 
-    If guardrails are not available (initialization failure or missing
-    config), falls back to returning an error message rather than raising.
+    Returns the generated response string, or None if guardrails are
+    unavailable or generation fails. Callers should fall back to direct
+    LLM generation when None is returned.
 
     Args:
         query: The user's natural language query.
         context: Retrieved context chunks to ground the generation.
 
     Returns:
-        The generated response string.
+        The generated response string, or None on failure.
     """
     rails_app = get_guardrails()
     if rails_app is None:
-        logger.error("Guardrails not available. Cannot generate safely.")
-        return "Error: Safety guardrails are not initialized."
+        logger.warning("Guardrails not available. Returning None for fallback.")
+        return None
 
-    # Append strict formatting and anti-tool-call instruction to the query for the local Llama model
+    # Append strict formatting, anti-tool-call, and citation instructions
     strict_query = (
         f"{query}\n\n"
         "IMPORTANT INSTRUCTIONS:\n"
         "1. Do not output JSON or tool calls. Answer directly in plain text using the context.\n"
-        "2. FORMATTING: If the answer is short, keep it to 1-2 lines. If the answer requires detail, ALWAYS start with a 1-2 sentence summary (gist), followed by a blank line, and then the detailed explanation.\n"
-        "3. NEVER write a single massive paragraph. Break long answers into multiple short paragraphs or use bullet points for readability."
+        "2. Cite your sources using [1], [2], etc. after each factual claim.\n"
+        "3. FORMATTING: If the answer is short, keep it to 1-2 lines. If the answer requires detail, ALWAYS start with a 1-2 sentence summary (gist), followed by a blank line, and then the detailed explanation.\n"
+        "4. NEVER write a single massive paragraph. Break long answers into multiple short paragraphs or use bullet points for readability."
     )
 
     messages = [
@@ -201,8 +203,11 @@ async def safe_generate(query: str, context: str = "") -> str:
         {"role": "user", "content": strict_query},
     ]
 
-    response = await rails_app.generate_async(messages=messages)
-
-    if isinstance(response, dict):
-        return response.get("content", "Error generating response.")
-    return str(response)
+    try:
+        response = await rails_app.generate_async(messages=messages)
+        if isinstance(response, dict):
+            return response.get("content") or None
+        return str(response) if response else None
+    except Exception as exc:
+        logger.warning("NeMo Guardrails generation failed: %s", exc)
+        return None

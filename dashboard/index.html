@@ -1,0 +1,268 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>WikiMind — Observability Dashboard</title>
+  <meta name="description" content="Real-time observability dashboard for WikiMind RAG pipeline. Monitor traces, provenance, attribution, guardrails, and evaluation metrics." />
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+
+  <!-- Chart.js -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+
+  <!-- Lucide Icons -->
+  <script src="https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js"></script>
+
+  <!-- Dashboard CSS -->
+  <link rel="stylesheet" href="css/dashboard.css" />
+
+  <style>
+    @keyframes spin { to { transform: rotate(360deg); } }
+  </style>
+</head>
+
+<body>
+
+  <!-- ═══════════════ HEADER ═══════════════ -->
+  <header class="dashboard-header">
+    <div class="header-inner">
+      <div class="logo-section">
+        <div class="logo-icon">
+          <i data-lucide="brain-circuit"></i>
+        </div>
+        <div>
+          <div class="logo-title">WikiMind Observability</div>
+          <div class="logo-sub">RAG Pipeline · Traces · Guardrails</div>
+        </div>
+      </div>
+
+      <div class="header-controls">
+        <div class="live-badge">
+          <span class="live-dot"></span>
+          <span>Live</span>
+        </div>
+
+        <div class="theme-toggle" onclick="toggleTheme()" title="Toggle light/dark mode" role="switch" aria-label="Toggle theme">
+          <div class="knob">
+            <i data-lucide="moon" style="width:11px;height:11px;color:#c4b5fd"></i>
+          </div>
+        </div>
+
+        <button id="refresh-btn" class="icon-btn" onclick="refreshDashboard()" title="Refresh data">
+          <i data-lucide="refresh-cw"></i>
+        </button>
+      </div>
+    </div>
+  </header>
+
+  <!-- ═══════════════ TAB NAVIGATION ═══════════════ -->
+  <nav class="tab-nav">
+    <button class="tab-btn active" data-tab="overview">
+      <i data-lucide="layout-dashboard"></i> Overview
+    </button>
+    <button class="tab-btn" data-tab="traces">
+      <i data-lucide="list"></i> Traces
+    </button>
+    <button class="tab-btn" data-tab="guardrails">
+      <i data-lucide="shield"></i> Guardrails
+    </button>
+    <button class="tab-btn" data-tab="evaluation">
+      <i data-lucide="flask-conical"></i> Evaluation
+    </button>
+    <button class="tab-btn" data-tab="system">
+      <i data-lucide="server"></i> System
+    </button>
+  </nav>
+
+  <!-- ═══════════════ MAIN CONTENT ═══════════════ -->
+  <main class="dashboard-main">
+
+    <!-- ── TAB: OVERVIEW ──────────────────────────────────────────── -->
+    <div id="tab-overview" class="tab-content active">
+
+      <!-- KPI Cards -->
+      <div id="overview-kpis" class="kpi-grid section-gap">
+        <!-- Populated by JS -->
+      </div>
+
+      <!-- Charts Row -->
+      <div class="chart-grid chart-grid-2-1 section-gap">
+        <!-- Latency Timeline -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <i data-lucide="activity" style="color:var(--accent-indigo)"></i>
+              Query Latency Timeline
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-container">
+              <canvas id="latency-timeline"></canvas>
+            </div>
+          </div>
+        </div>
+
+        <!-- Attribution Donut -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <i data-lucide="pie-chart" style="color:var(--accent-emerald)"></i>
+              Attribution
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-container" style="height:200px">
+              <canvas id="attribution-donut"></canvas>
+            </div>
+            <div id="attribution-legend" class="chart-legend" style="justify-content:center;margin-top:0.75rem">
+              <!-- Populated by JS -->
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Recent Queries Table -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <i data-lucide="clock" style="color:var(--accent-amber)"></i>
+            Recent Queries
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="trace-table">
+            <thead>
+              <tr>
+                <th>Time</th>
+                <th>Query</th>
+                <th class="right">Latency</th>
+                <th class="right">Steps</th>
+                <th class="center">Attribution</th>
+              </tr>
+            </thead>
+            <tbody id="overview-recent-tbody">
+              <tr><td colspan="5" style="text-align:center;color:var(--text-muted);padding:2rem">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TAB: TRACES ────────────────────────────────────────────── -->
+    <div id="tab-traces" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <i data-lucide="list" style="color:var(--accent-indigo)"></i>
+            Pipeline Traces
+            <span id="trace-count" style="font-size:0.7rem;color:var(--text-muted)"></span>
+          </div>
+        </div>
+        <div style="overflow-x:auto">
+          <table class="trace-table">
+            <thead>
+              <tr>
+                <th style="width:32px"></th>
+                <th>Time</th>
+                <th>Query</th>
+                <th class="right">Latency</th>
+                <th class="right">Steps</th>
+                <th class="center">Provenance</th>
+                <th class="center">Attribution</th>
+              </tr>
+            </thead>
+            <tbody id="trace-tbody">
+              <tr><td colspan="7" style="text-align:center;color:var(--text-muted);padding:2rem">Loading...</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TAB: GUARDRAILS ────────────────────────────────────────── -->
+    <div id="tab-guardrails" class="tab-content">
+      <div class="chart-grid chart-grid-1-1 section-gap">
+        <!-- Guardrails Donut -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <i data-lucide="shield" style="color:var(--accent-emerald)"></i>
+              Guardrails Status
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-container" style="height:200px">
+              <canvas id="guardrails-donut"></canvas>
+            </div>
+            <div id="guardrails-legend" class="chart-legend" style="justify-content:center;margin-top:0.75rem"></div>
+          </div>
+        </div>
+
+        <!-- Grade Breakdown -->
+        <div class="card">
+          <div class="card-header">
+            <div class="card-title">
+              <i data-lucide="bar-chart-3" style="color:var(--accent-violet)"></i>
+              Quality Grades
+            </div>
+          </div>
+          <div class="card-body">
+            <div class="chart-container" style="height:200px">
+              <canvas id="grades-bar"></canvas>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Guardrails Event Log -->
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <i data-lucide="scroll-text" style="color:var(--accent-amber)"></i>
+            Safety & Quality Events
+          </div>
+        </div>
+        <div id="guardrails-log">
+          <div style="text-align:center;color:var(--text-muted);padding:2rem">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+    <!-- ── TAB: EVALUATION ────────────────────────────────────────── -->
+    <div id="tab-evaluation" class="tab-content">
+      <div id="eval-content">
+        <div style="text-align:center;color:var(--text-muted);padding:2rem">Loading...</div>
+      </div>
+    </div>
+
+    <!-- ── TAB: SYSTEM ────────────────────────────────────────────── -->
+    <div id="tab-system" class="tab-content">
+      <div class="card">
+        <div class="card-header">
+          <div class="card-title">
+            <i data-lucide="server" style="color:var(--accent-sky)"></i>
+            Component Health
+          </div>
+        </div>
+        <div class="card-body" id="system-content">
+          <div style="text-align:center;color:var(--text-muted);padding:2rem">Loading...</div>
+        </div>
+      </div>
+    </div>
+
+  </main>
+
+  <!-- ═══════════════ FOOTER ═══════════════ -->
+  <footer class="dashboard-footer">
+    WikiMind Observability · Powered by Langfuse · Tri-Brid Hybrid Agentic RAG Pipeline
+  </footer>
+
+  <!-- Dashboard JS (ES Modules) -->
+  <script type="module" src="js/app.js"></script>
+
+</body>
+</html>

@@ -6,12 +6,16 @@ metrics instrumentation, and cache-first query routing.
 """
 
 import logging
+import os
 import time
+from collections import deque
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 from backend.cache import cache_lookup, cache_store, close_redis, get_redis_client
 from backend.config import get_settings
@@ -19,6 +23,42 @@ from backend.llmops import get_langfuse_client, init_observability
 from backend.models import ChatRequest, ChatResponse, HealthResponse, RetrievalMetadata, ServiceStatus
 
 logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# In-Memory Trace Log (ring buffer of last 500 query traces)
+# ---------------------------------------------------------------------------
+_MAX_TRACES = 500
+_trace_log: deque = deque(maxlen=_MAX_TRACES)
+
+
+def _record_trace(query: str, final_state: dict, latency_ms: float,
+                  cache_hit: bool = False, strategies: list = None) -> None:
+    """Record a query trace to the in-memory log for dashboard consumption."""
+    import datetime
+    _trace_log.append({
+        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+        "query": query,
+        "generation": final_state.get("generation", "")[:300],
+        "latency_ms": round(latency_ms),
+        "steps": final_state.get("steps", 0),
+        "tokens": {
+            "prompt": 0,  # populated by Langfuse if available
+            "completion": 0,
+        },
+        "provenance_score": final_state.get("provenance_score", 0.0),
+        "attribution": final_state.get("attribution", "unknown"),
+        "guardrails_applied": final_state.get("guardrails_applied", False),
+        "retrieval_grade": final_state.get("retrieval_grade", ""),
+        "hallucination_grade": final_state.get("hallucination_grade", ""),
+        "answer_grade": final_state.get("answer_grade", ""),
+        "hallucination_retries": final_state.get("hallucination_retries", 0),
+        "answer_retries": final_state.get("answer_retries", 0),
+        "document_count": len(final_state.get("documents", [])),
+        "expanded_queries": final_state.get("expanded_queries", []),
+        "strategies": strategies or [],
+        "cache_hit": cache_hit,
+        "citation_map": final_state.get("citation_map", {}),
+    })
 
 
 # ---------------------------------------------------------------------------
@@ -103,6 +143,12 @@ try:
     logger.info("Prometheus metrics instrumentation enabled.")
 except ImportError:
     logger.warning("prometheus-fastapi-instrumentator not installed. Metrics disabled.")
+
+# Mount dashboard static files
+_dashboard_dir = Path(__file__).resolve().parent.parent / "dashboard"
+if _dashboard_dir.is_dir():
+    app.mount("/dashboard", StaticFiles(directory=str(_dashboard_dir), html=True), name="dashboard")
+    logger.info("Dashboard mounted at /dashboard")
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +238,7 @@ async def chat_endpoint(request: ChatRequest):
     async def sse_generator():
         from backend.agent import agent_app, AgentState
         from backend.llmops import get_langfuse_handler
+        _sse_start_time = time.time()
         
         initial_state: AgentState = {
             "query": query,
@@ -208,6 +255,10 @@ async def chat_endpoint(request: ChatRequest):
             "hallucination_retries": 0,
             "answer_retries": 0,
             "as_of_date": request.as_of_date,
+            "citation_map": {},
+            "provenance_score": 0.0,
+            "attribution": "unknown",
+            "guardrails_applied": False,
         }
         
         # Setup Langfuse callbacks for per-query tracing
@@ -271,11 +322,26 @@ async def chat_endpoint(request: ChatRequest):
                         ),
                         "agent_steps": current_state.get("steps", 0),
                         "expanded_queries": current_state.get("expanded_queries", []),
-                    }
+                        "provenance_score": current_state.get("provenance_score", 0.0),
+                        "attribution": current_state.get("attribution", "unknown"),
+                        "guardrails_applied": current_state.get("guardrails_applied", False),
+                    },
+                    "citation_map": current_state.get("citation_map", {}),
                 }
                 
                 # Write to semantic cache
                 asyncio.create_task(cache_store(query, final_response))
+                
+                # Record trace for dashboard
+                trace_latency = (time.time() - _sse_start_time) * 1000
+                _record_trace(
+                    query=query,
+                    final_state=current_state,
+                    latency_ms=trace_latency,
+                    strategies=list(
+                        k for k, v in request.strategies.model_dump().items() if v
+                    ),
+                )
                 
                 yield {
                     "event": "final",
@@ -329,13 +395,26 @@ async def chat_compare(request: Request):
             "active_strategies": strategies,
             "hallucination_retries": 0,
             "answer_retries": 0,
+            "citation_map": {},
+            "provenance_score": 0.0,
+            "attribution": "unknown",
+            "guardrails_applied": False,
         }
 
         from backend.agent import agent_app
         import time as time_mod
+
+        # Langfuse trace per config
+        handler = get_langfuse_handler(
+            trace_name=f"compare_{config_name}",
+            session_id=f"compare_{int(time_mod.time())}",
+            metadata={"query": compare_req.query[:100], "config": config_name},
+        )
+        invoke_config = {"callbacks": [handler]} if handler else {}
+
         start = time_mod.monotonic()
         try:
-            final_state = await agent_app.ainvoke(initial_state)
+            final_state = await agent_app.ainvoke(initial_state, config=invoke_config)
             latency = time_mod.monotonic() - start
 
             sources = [
@@ -373,3 +452,98 @@ async def chat_compare(request: Request):
 
     return {"query": compare_req.query, "results": results}
 
+
+# ---------------------------------------------------------------------------
+# Dashboard API Endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/metrics")
+async def api_metrics():
+    """Aggregated dashboard metrics from the in-memory trace log."""
+    traces = list(_trace_log)
+    total = len(traces)
+
+    if total == 0:
+        return {
+            "summary": {
+                "total_queries": 0,
+                "p50_latency_ms": 0,
+                "p95_latency_ms": 0,
+                "avg_steps": 0,
+                "avg_provenance_score": 0.0,
+                "cache_hit_rate": 0.0,
+                "attribution_breakdown": {"rag_grounded": 0, "parametric_risk": 0, "unknown": 0},
+                "guardrails_stats": {"applied": 0, "bypassed": 0},
+                "grade_breakdown": {"grounded": 0, "hallucinated": 0, "useful": 0, "not_useful": 0},
+            },
+            "recent_traces": [],
+        }
+
+    latencies = sorted(t["latency_ms"] for t in traces)
+    p50 = latencies[len(latencies) // 2]
+    p95 = latencies[min(int(len(latencies) * 0.95), len(latencies) - 1)]
+
+    attr_breakdown = {"rag_grounded": 0, "parametric_risk": 0, "unknown": 0}
+    guard_stats = {"applied": 0, "bypassed": 0}
+    grade_breakdown = {"grounded": 0, "hallucinated": 0, "useful": 0, "not_useful": 0}
+    total_prov = 0.0
+    cache_hits = 0
+
+    for t in traces:
+        attr = t.get("attribution", "unknown")
+        attr_breakdown[attr] = attr_breakdown.get(attr, 0) + 1
+        if t.get("guardrails_applied"):
+            guard_stats["applied"] += 1
+        else:
+            guard_stats["bypassed"] += 1
+        total_prov += t.get("provenance_score", 0.0)
+        if t.get("cache_hit"):
+            cache_hits += 1
+        # Grade counts
+        hg = t.get("hallucination_grade", "")
+        if hg in grade_breakdown:
+            grade_breakdown[hg] += 1
+        ag = t.get("answer_grade", "")
+        if ag in grade_breakdown:
+            grade_breakdown[ag] += 1
+
+    return {
+        "summary": {
+            "total_queries": total,
+            "p50_latency_ms": round(p50),
+            "p95_latency_ms": round(p95),
+            "avg_steps": round(sum(t["steps"] for t in traces) / total, 1),
+            "avg_provenance_score": round(total_prov / total, 3),
+            "cache_hit_rate": round(cache_hits / total, 3),
+            "attribution_breakdown": attr_breakdown,
+            "guardrails_stats": guard_stats,
+            "grade_breakdown": grade_breakdown,
+        },
+        "recent_traces": list(reversed(traces[-50:])),
+    }
+
+
+@app.get("/api/traces")
+async def api_traces(limit: int = 100):
+    """Return the last N query traces for the dashboard."""
+    traces = list(_trace_log)
+    return {"traces": list(reversed(traces[-limit:]))}
+
+
+@app.get("/api/eval-results")
+async def api_eval_results():
+    """Return evaluation benchmark results if available."""
+    results_dir = Path(__file__).resolve().parent.parent / "evaluation" / "results"
+    if not results_dir.is_dir():
+        return {"results": []}
+
+    import json as json_mod
+    results = []
+    for f in sorted(results_dir.glob("*.json"), reverse=True):
+        try:
+            data = json_mod.loads(f.read_text(encoding="utf-8"))
+            data["filename"] = f.name
+            results.append(data)
+        except Exception:
+            continue
+    return {"results": results[:10]}  # last 10 benchmark runs
