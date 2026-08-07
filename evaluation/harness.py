@@ -79,7 +79,7 @@ async def _evaluate_single_query(
         "active_strategies": active_strategies,
         "hallucination_retries": 0,
         "answer_retries": 0,
-        "as_of_date": None,
+        "article_discovery_failed": False,
         "citation_map": {},
         "provenance_score": 0.0,
         "attribution": "unknown",

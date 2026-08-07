@@ -11,6 +11,7 @@ Supports two modes:
 - ``remote``: Connects to a running Qdrant server (e.g., via Docker Compose).
 """
 
+import asyncio
 import hashlib
 import logging
 import os
@@ -28,8 +29,43 @@ logger = logging.getLogger(__name__)
 # Qdrant Client Singletons
 # ---------------------------------------------------------------------------
 
-_async_client: Optional[AsyncQdrantClient] = None
+_async_client = None  # AsyncQdrantClient or LocalAsyncQdrantAdapter
 _sync_client: Optional[QdrantClient] = None
+
+
+class LocalAsyncQdrantAdapter:
+    """Adapter that wraps a sync QdrantClient to provide an async-compatible
+    interface by delegating all calls through ``asyncio.to_thread()``.
+
+    This avoids the embedded storage folder lock conflict that occurs when
+    both sync and async clients try to open the same embedded database, while
+    still allowing async callers (wiki_updater, reconciler, page_index) to
+    work transparently in local mode.
+    """
+
+    def __init__(self, sync_client: QdrantClient):
+        self._sync = sync_client
+
+    async def get_collection(self, **kwargs):
+        return await asyncio.to_thread(self._sync.get_collection, **kwargs)
+
+    async def scroll(self, **kwargs):
+        return await asyncio.to_thread(self._sync.scroll, **kwargs)
+
+    async def query_points(self, **kwargs):
+        return await asyncio.to_thread(self._sync.query_points, **kwargs)
+
+    async def upsert(self, **kwargs):
+        return await asyncio.to_thread(self._sync.upsert, **kwargs)
+
+    async def set_payload(self, **kwargs):
+        return await asyncio.to_thread(self._sync.set_payload, **kwargs)
+
+    async def search(self, **kwargs):
+        return await asyncio.to_thread(self._sync.search, **kwargs)
+
+    async def get_collections(self):
+        return await asyncio.to_thread(self._sync.get_collections)
 
 
 def _create_sync_client() -> QdrantClient:
@@ -50,19 +86,19 @@ def _create_sync_client() -> QdrantClient:
         )
 
 
-def _create_async_client() -> AsyncQdrantClient:
+def _create_async_client():
     """Create a Qdrant async client based on the configured mode.
 
-    In local (embedded) mode, we reuse the sync client's underlying storage
-    to avoid the storage folder lock conflict that occurs when two clients
-    try to open the same embedded database simultaneously.
+    In local (embedded) mode, returns a ``LocalAsyncQdrantAdapter`` that
+    wraps the sync client through asyncio.to_thread() to avoid the storage
+    folder lock conflict.
     """
     settings = get_settings()
 
     if settings.qdrant_mode == "local":
-        # In embedded mode, return None — we'll use sync client via asyncio.to_thread
-        logger.info("Async Qdrant: will delegate to sync client in embedded mode")
-        return None
+        # Wrap the sync client in an async adapter
+        logger.info("Async Qdrant: using LocalAsyncQdrantAdapter in embedded mode")
+        return LocalAsyncQdrantAdapter(get_sync_qdrant())
     else:
         logger.info("Using async Qdrant in REMOTE mode (url: %s)", settings.qdrant_url)
         return AsyncQdrantClient(
@@ -72,8 +108,8 @@ def _create_async_client() -> AsyncQdrantClient:
         )
 
 
-def get_async_qdrant() -> AsyncQdrantClient:
-    """Return a cached async Qdrant client instance."""
+def get_async_qdrant():
+    """Return a cached async Qdrant client instance (or adapter in local mode)."""
     global _async_client
     if _async_client is None:
         _async_client = _create_async_client()
@@ -135,18 +171,6 @@ def init_collection() -> None:
             field_schema=models.PayloadSchemaType.KEYWORD,
         )
 
-        # Temporal versioning payload indices
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name="is_current",
-            field_schema=models.PayloadSchemaType.BOOL,
-        )
-        client.create_payload_index(
-            collection_name=collection_name,
-            field_name="ingested_at",
-            field_schema=models.PayloadSchemaType.KEYWORD,
-        )
-        
         logger.info("Collection '%s' created successfully.", collection_name)
     except Exception as exc:
         logger.error("Failed to initialize Qdrant collection: %s", exc)

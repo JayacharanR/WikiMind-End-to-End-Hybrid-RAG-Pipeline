@@ -72,10 +72,12 @@ async def fetch_article_text(session: aiohttp.ClientSession, title: str) -> Opti
 
 
 async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSession) -> None:
-    """Process a single Wikipedia edit event with version-aware upserts.
+    """Process a single Wikipedia edit event.
 
-    Before inserting new chunks, marks all existing chunks for the article
-    as ``is_current=false`` so time-travel queries can distinguish versions.
+    Fetches the latest article text, chunks it, generates dual embeddings,
+    and upserts the new chunks into Qdrant. Uses deterministic point IDs
+    (based on title + chunk_index) so updates overwrite existing chunks
+    for the same article.
     """
     title = event_data.get("title")
     meta = event_data.get("meta", {})
@@ -90,8 +92,7 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     # 1. Fetch updated content
     text = await fetch_article_text(session, title)
     if not text:
-        logger.warning("Could not fetch text for %s. Skipping.", title)
-        return
+        raise RuntimeError(f"Failed to fetch article text for '{title}'")
 
     # 2. Chunking
     splitter = RecursiveCharacterTextSplitter(
@@ -103,38 +104,15 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     if not chunks:
         return
 
-    # 3. Mark existing chunks as not current (version archival)
+    # 3. Embedding
     qdrant = get_async_qdrant()
     settings = get_settings()
-    
-    try:
-        await qdrant.set_payload(
-            collection_name=settings.qdrant_collection,
-            payload={"is_current": False},
-            points=models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key="title",
-                        match=models.MatchValue(value=title),
-                    ),
-                    models.FieldCondition(
-                        key="is_current",
-                        match=models.MatchValue(value=True),
-                    ),
-                ]
-            ),
-        )
-        logger.debug("Archived existing chunks for: %s", title)
-    except Exception as exc:
-        logger.warning("Failed to archive old chunks for %s: %s", title, exc)
-
-    # 4. Embedding
     dense_model = get_dense_model()
     sparse_model = get_sparse_model()
     dense_embeddings = list(dense_model.embed(chunks))
     sparse_embeddings = list(sparse_model.embed(chunks))
 
-    # 5. Build new versioned points
+    # 4. Build points with deterministic IDs (overwrite existing chunks)
     from datetime import datetime, timezone
     ingested_at = datetime.now(timezone.utc).isoformat()
 
@@ -160,7 +138,6 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
                     "chunk_index": i,
                     "revision_id": revision_id,
                     "ingested_at": ingested_at,
-                    "is_current": True,
                 }
             )
         )

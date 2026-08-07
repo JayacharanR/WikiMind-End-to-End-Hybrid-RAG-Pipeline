@@ -69,7 +69,7 @@ async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
         return []
 
 
-async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]) -> List[str]:
+async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]) -> List[tuple]:
     """Check live Wikipedia revisions and compare to stored revision_ids.
 
     Queries the MediaWiki API for the latest revision ID of each title,
@@ -82,7 +82,7 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
         titles: List of article titles to check.
 
     Returns:
-        List of titles that have drifted and need re-ingestion.
+        List of (title, live_revision_id) tuples for articles that need re-ingestion.
     """
     if not titles:
         return []
@@ -128,10 +128,10 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
                             "Drift detected for '%s': stored=%s, live=%s",
                             page_title, stored_revid, live_revid,
                         )
-                        stale_titles.append(page_title)
+                        stale_titles.append((page_title, live_revid))
                     elif not stored_revid:
                         # No revision_id stored (legacy data), flag for refresh
-                        stale_titles.append(page_title)
+                        stale_titles.append((page_title, live_revid))
 
         except Exception as exc:
             logger.warning("Error checking live revisions: %s", exc)
@@ -157,10 +157,6 @@ async def _get_stored_revision(title: str) -> str:
                     qmodels.FieldCondition(
                         key="title",
                         match=qmodels.MatchValue(value=title),
-                    ),
-                    qmodels.FieldCondition(
-                        key="is_current",
-                        match=qmodels.MatchValue(value=True),
                     ),
                 ]
             ),
@@ -199,8 +195,12 @@ async def run_reconciliation_cycle():
             
             if stale_titles:
                 logger.warning("Detected drift in %d articles. Re-ingesting...", len(stale_titles))
-                for title in stale_titles:
-                    fake_event = {"title": title, "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"}}
+                for title, live_rev in stale_titles:
+                    fake_event = {
+                        "title": title,
+                        "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"},
+                        "revision": {"new": live_rev},
+                    }
                     try:
                         await process_event(fake_event, session)
                         success_count += 1

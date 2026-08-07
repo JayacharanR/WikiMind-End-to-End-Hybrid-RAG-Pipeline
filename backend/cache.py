@@ -101,10 +101,10 @@ async def l1_get(query: str) -> Optional[dict]:
     Returns:
         Cached response dict if found, None otherwise.
     """
-    client = await get_redis_client()
     key = _hash_query(query)
 
     try:
+        client = await get_redis_client()
         cached = await client.get(key)
         if cached is not None:
             logger.info("L1 cache HIT for query hash %s", key[-12:])
@@ -123,12 +123,11 @@ async def l1_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
         response: The response dict to cache.
         ttl: Time-to-live in seconds. Defaults to the static TTL from settings.
     """
-    settings = get_settings()
-    client = await get_redis_client()
-    key = _hash_query(query)
-    effective_ttl = ttl or settings.cache_ttl_static
-
     try:
+        settings = get_settings()
+        client = await get_redis_client()
+        key = _hash_query(query)
+        effective_ttl = ttl or settings.cache_ttl_static
         await client.setex(key, effective_ttl, json.dumps(response))
         logger.debug("L1 cache SET for query hash %s (TTL=%ds)", key[-12:], effective_ttl)
     except Exception as exc:

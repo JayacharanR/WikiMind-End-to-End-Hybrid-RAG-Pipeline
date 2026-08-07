@@ -70,6 +70,7 @@ services:
       - .env
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_MODE=remote
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       qdrant:
@@ -93,6 +94,7 @@ services:
       - .env
     environment:
       - QDRANT_URL=http://qdrant:6333
+      - QDRANT_MODE=remote
       - REDIS_URL=redis://redis:6379/0
     depends_on:
       qdrant:

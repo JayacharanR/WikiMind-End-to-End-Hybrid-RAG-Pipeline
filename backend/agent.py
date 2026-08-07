@@ -47,8 +47,8 @@ class AgentState(TypedDict):
     active_strategies: QueryStrategies
     hallucination_retries: int
     answer_retries: int
-    as_of_date: str
-    # --- Provenance & Attribution (added) ---
+    article_discovery_failed: bool  # True when article index returns nothing
+    # --- Provenance & Attribution ---
     citation_map: Dict          # {1: chunk_dict, 2: chunk_dict, ...}
     provenance_score: float     # 0.0–1.0, fraction of cited claims verified
     attribution: str            # "rag_grounded", "parametric_risk", or "unknown"
@@ -185,8 +185,7 @@ async def node_retrieve(state: AgentState) -> Dict:
     for q in queries_to_search:
         docs, _ = await hybrid_search(
             q,
-            article_titles=None,  # Bypass strict article filtering to allow global Dense+Sparse RRF
-            as_of_date=state.get("as_of_date")
+            article_titles=target_articles if target_articles else None,
         )
         for doc in docs:
             if doc["id"] not in seen_ids:
@@ -256,10 +255,6 @@ async def node_page_index(state: AgentState) -> Dict:
                             qmodels.FieldCondition(
                                 key="title",
                                 match=qmodels.MatchValue(value=article_title),
-                            ),
-                            qmodels.FieldCondition(
-                                key="is_current",
-                                match=qmodels.MatchValue(value=True),
                             ),
                         ]
                     ),
@@ -459,30 +454,28 @@ async def _direct_llm_generate(query: str, context: str) -> str:
 
 
 async def node_generate_from_web(state: AgentState) -> Dict:
-    """Node: Generate a response using fallback context.
+    """Node: Return a deterministic abstention when no verified context exists.
 
-    Called when scoped retrieval returns no relevant documents. Uses any
-    available web snippets or generates a response acknowledging that no
-    relevant context was found.
+    Called when scoped retrieval returns no relevant documents. Instead of
+    generating from LLM parametric memory (which would be ungrounded), returns
+    a clear abstention message. This ensures the system never presents
+    unverified information as if it came from Wikipedia.
     """
-    query = state["query"]
-    web_snippets = state.get("web_snippets", [])
     steps = state.get("steps", 0) + 1
 
-    logger.info("--- NODE: GENERATE FALLBACK (step %d) ---", steps)
+    logger.info("--- NODE: ABSTENTION (step %d) ---", steps)
 
-    if web_snippets:
-        context, citation_map = _build_cited_context(web_snippets)
-    else:
-        context = "No relevant context was found."
-        citation_map = {}
-
-    generation = await _direct_llm_generate(query, context)
+    generation = (
+        "I could not find verified Wikipedia sources to answer this question. "
+        "Please try rephrasing your query or asking about a different topic."
+    )
 
     return {
         "generation": generation,
-        "documents": web_snippets,
-        "citation_map": citation_map,
+        "documents": [],
+        "citation_map": {},
+        "provenance_score": 0.0,
+        "attribution": "abstention",
         "steps": steps,
     }
 

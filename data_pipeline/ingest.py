@@ -343,7 +343,6 @@ def process_batch(
             "entities": point_data.get("entities", []),
             "revision_id": point_data.get("revision_id", ""),
             "ingested_at": point_data.get("ingested_at", ""),
-            "is_current": True,
         }
         
         qdrant_points.append(

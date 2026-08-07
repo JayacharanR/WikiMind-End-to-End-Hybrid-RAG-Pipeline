@@ -80,7 +80,6 @@ def extract_title_from_wikipedia_url(url: str) -> Optional[str]:
 async def hybrid_search(
     query: str,
     article_titles: Optional[List[str]] = None,
-    as_of_date: Optional[str] = None,
 ) -> tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Execute a hybrid dense+sparse search using Qdrant Prefetch API for RRF.
 
@@ -89,18 +88,12 @@ async def hybrid_search(
     dramatically reduces noise by restricting retrieval to the specific
     Wikipedia articles identified by the article discovery step.
 
-    When ``as_of_date`` is provided (ISO format string), performs a time-travel
-    query by filtering chunks ingested on or before that date, regardless of
-    their ``is_current`` status. Otherwise, defaults to only returning chunks
-    with ``is_current=true``.
-
     The cross-encoder reranker is always applied to ensure maximum precision.
 
     Args:
         query: The natural language search query.
         article_titles: Optional list of Wikipedia article titles to scope
             the search to. When None, searches the entire collection.
-        as_of_date: Optional ISO date string for time-travel queries.
 
     Returns:
         Tuple of (List of candidate documents, Metadata dict).
@@ -112,9 +105,9 @@ async def hybrid_search(
 
     logger.debug("Generating dual embeddings for query: %s", query)
 
-    # Generate embeddings
-    dense_vector = list(dense_model.embed([query]))[0].tolist()
-    sparse_obj = list(sparse_model.embed([query]))[0]
+    # Generate embeddings (offloaded to thread to avoid blocking async loop)
+    dense_vector = (await asyncio.to_thread(lambda: list(dense_model.embed([query]))[0].tolist()))
+    sparse_obj = (await asyncio.to_thread(lambda: list(sparse_model.embed([query]))[0]))
     sparse_vector = models.SparseVector(
         indices=sparse_obj.indices.tolist(),
         values=sparse_obj.values.tolist(),
@@ -135,25 +128,6 @@ async def hybrid_search(
             "Scoping hybrid search to %d article(s): %s",
             len(article_titles),
             ", ".join(article_titles[:5]),
-        )
-
-    # Temporal filter
-    if as_of_date:
-        # Time-travel mode: return chunks ingested on or before the given date
-        filter_conditions.append(
-            models.FieldCondition(
-                key="ingested_at",
-                range=models.Range(lte=as_of_date),
-            )
-        )
-        logger.info("Time-travel mode: as_of_date=%s", as_of_date)
-    else:
-        # Default mode: only return current version of chunks
-        filter_conditions.append(
-            models.FieldCondition(
-                key="is_current",
-                match=models.MatchValue(value=True),
-            )
         )
 
     query_filter = models.Filter(must=filter_conditions) if filter_conditions else None

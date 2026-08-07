@@ -173,23 +173,6 @@ def configure_sidebar() -> Dict[str, Any]:
     
     st.sidebar.divider()
     
-    st.sidebar.subheader("Time-Travel Mode")
-    time_travel = st.sidebar.toggle(
-        "Enable Time-Travel",
-        value=False,
-        help="Query the knowledge base as it existed on a specific date.",
-    )
-    as_of_date = None
-    if time_travel:
-        from datetime import date
-        selected_date = st.sidebar.date_input(
-            "As of date:",
-            value=date.today(),
-            help="Retrieve articles ingested on or before this date.",
-        )
-        as_of_date = selected_date.isoformat() + "T23:59:59Z"
-        st.sidebar.caption(f"Querying as of: {as_of_date}")
-
     st.sidebar.divider()
     
     st.sidebar.subheader("System Health")
@@ -214,19 +197,20 @@ def configure_sidebar() -> Dict[str, Any]:
         "hyde": hyde,
         "step_back": step_back,
         "decomposition": decomposition,
-        "as_of_date": as_of_date,
     }
 
 
 def stream_chat_response(query: str, strategies: Dict[str, bool]):
-    """Stream the response from the FastAPI SSE endpoint."""
-    as_of_date = strategies.pop("as_of_date", None)
+    """Stream the response from the FastAPI SSE endpoint.
+    
+    Handles two response modes:
+    - JSON (cache hit): Backend returns application/json immediately
+    - SSE (cache miss): Backend streams node-by-node progress events
+    """
     payload = {
         "query": query,
         "strategies": strategies,
     }
-    if as_of_date:
-        payload["as_of_date"] = as_of_date
     
     try:
         start_time = time.time()
@@ -238,7 +222,29 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
             headers={'Accept': 'text/event-stream'}
         )
         response.raise_for_status()
-        
+
+        # Cache hit: backend returns JSON directly
+        content_type = response.headers.get("content-type", "")
+        if "application/json" in content_type:
+            total_time = time.time() - start_time
+            data = response.json()
+            answer = data.get("answer", "")
+            sources = data.get("sources", [])
+            metadata = data.get("metadata", {})
+            metadata["total_time_seconds"] = round(total_time, 2)
+            st.markdown(answer)
+            if sources:
+                with st.expander(f"View {len(sources)} Retrieved Sources"):
+                    for i, source in enumerate(sources):
+                        st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
+                        st.markdown(f"> {source.get('content', '')[:300]}...")
+                        st.divider()
+            with st.expander("Execution Metadata"):
+                st.json(metadata)
+            st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources, "metadata": metadata})
+            return
+
+        # Cache miss: parse SSE stream
         client = sseclient.SSEClient(response)
         
         status_placeholder = st.empty()

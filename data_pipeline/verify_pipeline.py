@@ -118,7 +118,7 @@ async def test_existing_data() -> bool:
                     ]
                 ),
                 limit=5,
-                with_payload=["title", "chunk_index", "is_current"],
+                with_payload=["title", "chunk_index"],
                 with_vectors=False,
             )
             if len(results) > 0:
@@ -185,7 +185,7 @@ async def test_process_event() -> bool:
                     ]
                 ),
                 limit=5,
-                with_payload=["title", "chunk_index", "is_current"],
+                with_payload=["title", "chunk_index"],
                 with_vectors=False,
             )
 

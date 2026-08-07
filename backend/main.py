@@ -220,7 +220,12 @@ async def chat_endpoint(request: ChatRequest):
     query = request.query
 
     # Cache-first: check L1 and L2 before running the agent
-    cached_response, cache_level = await cache_lookup(query)
+    try:
+        cached_response, cache_level = await cache_lookup(query)
+    except Exception as exc:
+        logger.warning("Cache lookup infrastructure failure (degraded mode): %s", exc)
+        cached_response, cache_level = None, None
+
     if cached_response is not None:
         logger.info("Serving cached response (level=%s) for: %s", cache_level, query[:60])
         return JSONResponse(content={
@@ -254,7 +259,7 @@ async def chat_endpoint(request: ChatRequest):
             "active_strategies": request.strategies,
             "hallucination_retries": 0,
             "answer_retries": 0,
-            "as_of_date": request.as_of_date,
+            "article_discovery_failed": False,
             "citation_map": {},
             "provenance_score": 0.0,
             "attribution": "unknown",
@@ -329,8 +334,15 @@ async def chat_endpoint(request: ChatRequest):
                     "citation_map": current_state.get("citation_map", {}),
                 }
                 
-                # Write to semantic cache
-                asyncio.create_task(cache_store(query, final_response))
+                # Write to cache — but skip abstention/error responses
+                attribution = current_state.get("attribution", "unknown")
+                answer_text = final_response.get("answer", "")
+                is_cacheable = (
+                    attribution != "abstention"
+                    and "Error generating response" not in answer_text
+                )
+                if is_cacheable:
+                    asyncio.create_task(cache_store(query, final_response))
                 
                 # Record trace for dashboard
                 trace_latency = (time.time() - _sse_start_time) * 1000
