@@ -71,6 +71,8 @@ class Settings(BaseSettings):
     max_graph_steps: int = 12
     max_generation_docs: int = 5
     tavily_max_results: int = 3
+    max_hallucination_retries: int = 1
+    max_answer_retries: int = 1
 
     # --- Application Server -----------------------------------------------
     app_host: str = "0.0.0.0"

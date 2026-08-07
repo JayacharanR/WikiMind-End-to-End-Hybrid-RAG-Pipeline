@@ -82,7 +82,8 @@ class CompareRequest(BaseModel):
     configs: list[dict] = Field(
         ...,
         min_length=2,
-        description="List of strategy config dicts, each with a 'name' key and strategy booleans.",
+        max_length=5,
+        description="List of strategy config dicts, each with a 'name' key and strategy booleans. Max 5.",
     )
 
 

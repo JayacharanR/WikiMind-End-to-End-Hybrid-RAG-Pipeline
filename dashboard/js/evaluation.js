@@ -3,6 +3,15 @@
 // ═══════════════════════════════════════════════════════════════════════════
 
 /**
+ * Escape HTML special characters to prevent XSS.
+ */
+function escapeHtml(str) {
+  if (typeof str !== 'string') return str ?? '';
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
+/**
  * Render evaluation benchmark results.
  * @param {Array} results - from /api/eval-results
  */
@@ -24,7 +33,7 @@ export function renderEvaluationTab(results) {
   container.innerHTML = results.map(result => {
     const agg = result.aggregate || {};
     const perQuery = result.per_query || [];
-    const filename = result.filename || 'unknown';
+    const filename = escapeHtml(result.filename || 'unknown');
 
     return `
       <div class="card section-gap">
@@ -62,7 +71,7 @@ export function renderEvaluationTab(results) {
                 <tbody>
                   ${perQuery.map(q => `
                     <tr>
-                      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${q.question || '—'}</td>
+                      <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(q.question || '—')}</td>
                       <td class="mono right">${q.recall_at_5?.toFixed(2) ?? '—'}</td>
                       <td class="mono right">${q.mrr?.toFixed(3) ?? '—'}</td>
                       <td class="mono right">${q.answer_accuracy?.toFixed(2) ?? '—'}</td>
@@ -85,7 +94,7 @@ function renderMetricStat(label, value, color) {
   const display = typeof value === 'number' ? value.toFixed(3) : (value || '—');
   return `
     <div class="stat-item">
-      <div class="stat-label">${label}</div>
-      <div class="stat-value" style="color:${color}">${display}</div>
+      <div class="stat-label">${escapeHtml(label)}</div>
+      <div class="stat-value" style="color:${color}">${escapeHtml(String(display))}</div>
     </div>`;
 }

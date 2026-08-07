@@ -696,36 +696,33 @@ async def node_check_answer_quality(state: AgentState) -> Dict:
 
     logger.info("--- NODE: CHECK ANSWER QUALITY (step %d) ---", steps)
 
-    # Heuristic bypass: non-trivial responses skip the LLM quality check
+    # Always run LLM quality check (no heuristic bypass)
     is_useful = False
-    if len(generation.split()) >= 10 and "cannot answer" not in generation.lower():
-        logger.info("Answer quality check passed (heuristic: non-trivial response).")
+    llm = _get_llm(temperature=0.0, max_tokens=20)
+    prompt = ChatPromptTemplate.from_messages([
+        ("system",
+         "You are an answer quality checker. Determine if the ANSWER attempts "
+         "to address the QUESTION, even if partially.\n\n"
+         "Rules:\n"
+         "- Answer 'yes' if the response provides any relevant information "
+         "about the question, even if incomplete.\n"
+         "- Answer 'no' ONLY if the response is completely off-topic, empty, "
+         "or explicitly refuses to answer.\n\n"
+         "Respond with ONLY the word 'yes' or 'no'."),
+        ("user",
+         "QUESTION: {query}\n\n"
+         "ANSWER: {generation}\n\n"
+         "Does the answer address the question? (yes/no):"),
+    ])
+    try:
+        res = await (prompt | llm).ainvoke({"query": query, "generation": generation})
+        raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
+        first_word = raw.split()[0] if raw.split() else ""
+        is_useful = "yes" in first_word or (first_word != "no" and "yes" in raw)
+    except Exception as exc:
+        logger.warning("Answer quality check LLM call failed: %s. Defaulting to unknown.", exc)
+        # Default to unknown on exception — let routing decide
         is_useful = True
-    else:
-        llm = _get_llm(temperature=0.0, max_tokens=20)
-        prompt = ChatPromptTemplate.from_messages([
-            ("system",
-             "You are an answer quality checker. Determine if the ANSWER attempts "
-             "to address the QUESTION, even if partially.\n\n"
-             "Rules:\n"
-             "- Answer 'yes' if the response provides any relevant information "
-             "about the question, even if incomplete.\n"
-             "- Answer 'no' ONLY if the response is completely off-topic, empty, "
-             "or explicitly refuses to answer.\n\n"
-             "Respond with ONLY the word 'yes' or 'no'."),
-            ("user",
-             "QUESTION: {query}\n\n"
-             "ANSWER: {generation}\n\n"
-             "Does the answer address the question? (yes/no):"),
-        ])
-        try:
-            res = await (prompt | llm).ainvoke({"query": query, "generation": generation})
-            raw = (res.content if hasattr(res, "content") else str(res)).strip().lower()
-            first_word = raw.split()[0] if raw.split() else ""
-            is_useful = "yes" in first_word or (first_word != "no" and "yes" in raw)
-        except Exception as exc:
-            logger.warning("Answer quality check failed: %s. Passing through.", exc)
-            is_useful = True
 
     if not is_useful:
         logger.warning("Answer quality failed (not useful). Retry %d.", retries + 1)
@@ -771,32 +768,37 @@ def route_after_grading(state: AgentState) -> Literal["generate_from_web", "gene
 def route_after_hallucination(
     state: AgentState,
 ) -> Literal["generate", "check_answer_quality"]:
-    """Route based on grounding. Retry generation if hallucinated (max 2 retries).
+    """Route based on grounding. Retry generation if hallucinated.
 
-    Does not loop back to retrieve -- the documents are already scoped
-    and reranked. Instead, retries the generation step with the same context.
+    Uses config-driven retry budget (max_hallucination_retries). On retry,
+    the same documents are reused with a fresh LLM call.
     """
     if _is_over_budget(state):
         logger.warning("Step budget exhausted. Forcing answer quality check.")
         return "check_answer_quality"
 
+    settings = get_settings()
     if (
         state.get("hallucination_grade") == "hallucinated"
-        and state.get("hallucination_retries", 0) < 1
+        and state.get("hallucination_retries", 0) < settings.max_hallucination_retries
     ):
         return "generate"
     return "check_answer_quality"
 
 
 def route_after_answer_quality(state: AgentState) -> Literal["expand_query", "__end__"]:
-    """Route based on answer usefulness. Expand query if not useful (max 2 retries)."""
+    """Route based on answer usefulness. Expand query if not useful.
+
+    Uses config-driven retry budget (max_answer_retries).
+    """
     if _is_over_budget(state):
         logger.warning("Step budget exhausted. Terminating graph.")
         return END
 
+    settings = get_settings()
     if (
         state.get("answer_grade") == "not_useful"
-        and state.get("answer_retries", 0) < 1
+        and state.get("answer_retries", 0) < settings.max_answer_retries
     ):
         return "expand_query"
     return END

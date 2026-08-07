@@ -127,12 +127,18 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS middleware for Streamlit frontend cross-origin requests
+# CORS middleware — restrict to known frontend origins
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "http://localhost:8501",     # Streamlit default
+        "http://127.0.0.1:8501",
+        "http://localhost:8080",     # Dashboard
+        "http://127.0.0.1:8080",
+        "http://localhost:3000",
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -544,7 +550,12 @@ async def api_traces(limit: int = 100):
 
 @app.get("/api/eval-results")
 async def api_eval_results():
-    """Return evaluation benchmark results if available."""
+    """Return evaluation benchmark results if available.
+
+    Normalizes the JSON shape to match the dashboard's expected format:
+    - ``aggregate`` (dashboard) ← ``aggregates`` (harness output)
+    - ``per_query`` (dashboard) ← ``per_query_results`` (harness output)
+    """
     results_dir = Path(__file__).resolve().parent.parent / "evaluation" / "results"
     if not results_dir.is_dir():
         return {"results": []}
@@ -554,8 +565,16 @@ async def api_eval_results():
     for f in sorted(results_dir.glob("*.json"), reverse=True):
         try:
             data = json_mod.loads(f.read_text(encoding="utf-8"))
-            data["filename"] = f.name
-            results.append(data)
+            # Normalize keys for dashboard compatibility
+            normalized = {
+                "filename": f.name,
+                "aggregate": data.get("aggregates", data.get("aggregate", {})),
+                "per_query": data.get("per_query_results", data.get("per_query", [])),
+                "dataset": data.get("dataset", ""),
+                "timestamp": data.get("timestamp", ""),
+                "config": data.get("config", {}),
+            }
+            results.append(normalized)
         except Exception:
             continue
     return {"results": results[:10]}  # last 10 benchmark runs

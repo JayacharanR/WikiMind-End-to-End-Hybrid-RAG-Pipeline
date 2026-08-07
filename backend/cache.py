@@ -78,16 +78,24 @@ def _normalize_query(query: str) -> str:
     return query.strip().lower().rstrip("?.!")
 
 
-def _hash_query(query: str) -> str:
-    """Generate a SHA-256 hash key for a normalized query.
+def _hash_query(query: str, strategies: dict = None) -> str:
+    """Generate a SHA-256 hash key for a normalized query + strategies.
+
+    Includes active strategies in the hash so the same query with different
+    strategy configurations produces distinct cache keys.
 
     Args:
-        query: Normalized query string.
+        query: Raw query string.
+        strategies: Optional dict of strategy toggles (e.g., {"multi_query": True}).
 
     Returns:
         Hex-encoded SHA-256 hash prefixed with ``wikimind:cache:l1:``.
     """
     normalized = _normalize_query(query)
+    # Include sorted active strategy names in the hash
+    if strategies:
+        active = sorted(k for k, v in strategies.items() if v)
+        normalized += "|" + ",".join(active)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return f"wikimind:cache:l1:{digest}"
 

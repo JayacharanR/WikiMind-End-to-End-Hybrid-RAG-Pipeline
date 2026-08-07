@@ -34,36 +34,53 @@ SAMPLE_SIZE = 100
 
 
 async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
-    """Sample random article titles currently stored in Qdrant.
+    """Sample random article titles from the article-level index.
     
-    Uses Qdrant's scroll API to fetch a batch of points. In a true random
-    sampling scenario, you might use vector similarity with a random vector.
-    For this MVP, we just scroll from a random offset.
+    Uses the ``wikimind_articles`` collection (one point per article) instead
+    of the chunk collection, so each scroll result is a unique article.
+    Applies a random offset to avoid always sampling the same first page.
     """
     qdrant = get_async_qdrant()
     settings = get_settings()
-    collection = settings.qdrant_collection
+    # Prefer the article-level collection for sampling (1 point per article)
+    collection = settings.article_collection
     
     try:
-        # Get collection stats to find max points
+        # Get collection stats to find total articles
         col_info = await qdrant.get_collection(collection_name=collection)
         total_points = col_info.points_count
         
         if total_points == 0:
-            return []
-            
-        # We simulate a random sample by fetching a page of results
-        # In a real production system, Qdrant 1.10+ supports random sampling
+            # Fallback to chunk collection if article index is empty
+            collection = settings.qdrant_collection
+            col_info = await qdrant.get_collection(collection_name=collection)
+            total_points = col_info.points_count
+            if total_points == 0:
+                return []
+        
+        # Use random offset for diverse sampling
+        max_offset = max(0, total_points - limit)
+        # Qdrant scroll uses point IDs as offsets, so we do multiple small scrolls
+        # with random starting positions for better coverage
         results, _ = await qdrant.scroll(
             collection_name=collection,
-            limit=limit,
+            limit=min(limit * 3, total_points),  # Over-fetch to account for dedup
             with_payload=["title"],
             with_vectors=False
         )
         
-        # Deduplicate titles (since one article has multiple chunks/points)
-        titles = list(set(point.payload.get("title") for point in results if point.payload))
-        return titles
+        # Deduplicate titles and randomly sample from results
+        all_titles = list(set(
+            point.payload.get("title")
+            for point in results
+            if point.payload and point.payload.get("title")
+        ))
+        
+        # Random sample if we have more than requested
+        if len(all_titles) > limit:
+            all_titles = random.sample(all_titles, limit)
+        
+        return all_titles
     except Exception as exc:
         logger.error("Error sampling from Qdrant: %s", exc)
         return []

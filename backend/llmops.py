@@ -9,7 +9,6 @@ to explicit function calls during the FastAPI lifespan startup.
 """
 
 import logging
-import os
 from functools import lru_cache
 from typing import Optional
 
@@ -30,17 +29,17 @@ def _create_langfuse_client() -> Optional[Langfuse]:
     Returns:
         Langfuse client if credentials are configured, None otherwise.
     """
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    from backend.config import get_settings
+    settings = get_settings()
 
-    if not secret_key or not public_key:
+    if not settings.langfuse_secret_key or not settings.langfuse_public_key:
         logger.warning("Langfuse credentials missing. Observability is disabled.")
         return None
 
     client = Langfuse(
-        secret_key=secret_key,
-        public_key=public_key,
-        host=os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com"),
+        secret_key=settings.langfuse_secret_key,
+        public_key=settings.langfuse_public_key,
+        host=settings.langfuse_host,
     )
     return client
 
@@ -90,17 +89,17 @@ def get_langfuse_handler(**kwargs) -> Optional[LangfuseCallbackHandler]:
     Returns:
         Optional[LangfuseCallbackHandler]: Handler or None.
     """
-    secret_key = os.getenv("LANGFUSE_SECRET_KEY", "")
-    public_key = os.getenv("LANGFUSE_PUBLIC_KEY", "")
+    from backend.config import get_settings
+    settings = get_settings()
 
-    if not secret_key or not public_key or "placeholder" in secret_key:
+    if not settings.langfuse_secret_key or not settings.langfuse_public_key or "placeholder" in settings.langfuse_secret_key:
         return None
 
     try:
         return LangfuseCallbackHandler(
-            secret_key=secret_key,
-            public_key=public_key,
-            host=os.getenv("LANGFUSE_HOST", "http://localhost:3000"),
+            secret_key=settings.langfuse_secret_key,
+            public_key=settings.langfuse_public_key,
+            host=settings.langfuse_host,
             **kwargs,
         )
     except Exception as exc:

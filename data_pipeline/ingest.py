@@ -23,21 +23,19 @@ if hasattr(sys.stdout, "reconfigure"):
 import queue
 import threading
 
-# For Windows + Python 3.8+: inject cuDNN dlls so ONNX Runtime doesn't fallback to CPU
+# Optional: inject cuDNN DLLs for ONNX Runtime GPU acceleration on Windows
 if os.name == 'nt':
-    cudnn_path = r"D:\adobe and davinci resolve files"
-    if os.path.exists(cudnn_path):
+    cudnn_path = os.environ.get("CUDNN_PATH", "")
+    if cudnn_path and os.path.exists(cudnn_path):
         os.environ["PATH"] = cudnn_path + os.pathsep + os.environ.get("PATH", "")
         os.add_dll_directory(cudnn_path)
 
-# Force all caching to happen on the D drive instead of the C drive
-cache_dir = r"D:\charan project\WikiMind-End-to-End-Hybrid-RAG-Pipeline\data\cache"
+# Set up cache directories (portable: uses env var or project-relative default)
+_project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+cache_dir = os.environ.get("WIKIMIND_CACHE_DIR", os.path.join(_project_root, "data", "cache"))
 os.makedirs(cache_dir, exist_ok=True)
-os.environ["HF_HOME"] = os.path.join(cache_dir, "huggingface")
-os.environ["FASTEMBED_CACHE_PATH"] = os.path.join(cache_dir, "fastembed")
-os.environ["TMPDIR"] = cache_dir
-os.environ["TEMP"] = cache_dir
-os.environ["TMP"] = cache_dir
+os.environ.setdefault("HF_HOME", os.path.join(cache_dir, "huggingface"))
+os.environ.setdefault("FASTEMBED_CACHE_PATH", os.path.join(cache_dir, "fastembed"))
 
 import time
 from datetime import datetime, timezone

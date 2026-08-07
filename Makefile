@@ -1,4 +1,4 @@
-.PHONY: dev ingest test lint clean logs stop help
+.PHONY: dev ingest test lint clean logs stop help verify
 
 help:
 	@echo "WikiMind Tri-Brid RAG Pipeline Makefile"
@@ -9,6 +9,7 @@ help:
 	@echo "  ingest   - Run the Wikipedia batch ingestion script locally"
 	@echo "  test     - Run the pytest test suite"
 	@echo "  lint     - Run ruff for code linting and formatting"
+	@echo "  verify   - Run the pipeline verification suite"
 	@echo "  clean    - Remove docker volumes, caches, and orphaned containers"
 	@echo "  logs     - Tail the logs for all docker-compose services"
 
@@ -20,14 +21,17 @@ stop:
 	docker-compose down
 
 ingest:
-	poetry run python -m data_pipeline.ingest
+	uv run python -m data_pipeline.ingest
 
 test:
-	poetry run pytest tests/ -v
+	uv run pytest tests/ -v
 
 lint:
-	poetry run ruff check .
-	poetry run ruff format --check .
+	uv run ruff check .
+	uv run ruff format --check .
+
+verify:
+	uv run python -m data_pipeline.verify_pipeline
 
 clean:
 	docker-compose down -v --remove-orphans
