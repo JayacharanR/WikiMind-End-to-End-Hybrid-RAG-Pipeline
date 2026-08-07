@@ -136,56 +136,96 @@ async def l1_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
 
 
 # ---------------------------------------------------------------------------
-# L2 Semantic Cache (RedisVL)
+# L2 Semantic Cache (dual-strategy: RedisVL primary, pure-Redis fallback)
 # ---------------------------------------------------------------------------
-# The L2 semantic cache uses RedisVL's SemanticCache class which requires
-# a Redis instance with the RediSearch module (provided by redis-stack).
-# Initialization is deferred to avoid import-time failures when Redis is
-# not available (e.g., during testing or local development without Docker).
+# Strategy 1 (Primary): RedisVL SemanticCache with HNSW index (requires Redis Stack)
+# Strategy 2 (Fallback): Pure-Redis with FastEmbed embeddings + brute-force cosine
+# Strategy 3 (Degraded): L2 disabled entirely (standard logging)
 
 _semantic_cache = None
+_l2_strategy: Optional[str] = None  # "redisvl", "pure_redis", or None
+_l2_embed_model = None
+
+# Pool size cap for pure-Redis L2 fallback
+_L2_POOL_PREFIX = "wikimind:cache:l2:pool"
+_L2_MAX_POOL_SIZE = 500
 
 
-async def _get_semantic_cache():
-    """Lazy-initialize the RedisVL SemanticCache.
+def _cosine_similarity(a: list, b: list) -> float:
+    """Compute cosine similarity between two vectors."""
+    import math
+    dot = sum(x * y for x, y in zip(a, b))
+    norm_a = math.sqrt(sum(x * x for x in a))
+    norm_b = math.sqrt(sum(x * x for x in b))
+    if norm_a == 0 or norm_b == 0:
+        return 0.0
+    return dot / (norm_a * norm_b)
 
-    The cache is initialized on first access. If RedisVL or the Redis
-    Search module is unavailable, returns None and logs a warning.
 
-    Returns:
-        SemanticCache instance or None.
-    """
-    global _semantic_cache
-    if _semantic_cache is not None:
-        return _semantic_cache
+def _get_l2_embed_model():
+    """Lazy-init the FastEmbed model for pure-Redis L2."""
+    global _l2_embed_model
+    if _l2_embed_model is None:
+        try:
+            from fastembed import TextEmbedding
+            settings = get_settings()
+            _l2_embed_model = TextEmbedding(model_name=settings.embedding_model)
+            logger.debug("L2 FastEmbed model loaded: %s", settings.embedding_model)
+        except Exception as exc:
+            logger.warning("Failed to load FastEmbed for L2: %s", exc)
+    return _l2_embed_model
 
+
+async def _init_l2_strategy():
+    """Determine and initialize the best available L2 strategy."""
+    global _semantic_cache, _l2_strategy
+
+    if _l2_strategy is not None:
+        return _l2_strategy
+
+    # Strategy 1: Try RedisVL (requires Redis Stack with RediSearch)
     try:
         from redisvl.extensions.llmcache import SemanticCache
-
         settings = get_settings()
         _semantic_cache = SemanticCache(
             name="wikimind_l2_cache",
             redis_url=settings.redis_url,
             distance_threshold=1.0 - settings.cache_similarity_threshold,
         )
+        _l2_strategy = "redisvl"
         logger.info(
-            "L2 semantic cache initialized (threshold=%.2f).",
+            "L2 semantic cache: RedisVL strategy (threshold=%.2f).",
             settings.cache_similarity_threshold,
         )
-        return _semantic_cache
+        return _l2_strategy
     except ImportError:
-        logger.warning("RedisVL not available. L2 semantic cache disabled.")
-        return None
+        logger.info("RedisVL not installed. Trying pure-Redis L2 fallback...")
     except Exception as exc:
-        logger.warning("L2 semantic cache initialization failed: %s", exc)
-        return None
+        logger.info("RedisVL init failed (%s). Trying pure-Redis L2 fallback...", exc)
+
+    # Strategy 2: Pure-Redis with FastEmbed
+    try:
+        model = _get_l2_embed_model()
+        if model is not None:
+            client = await get_redis_client()
+            await client.ping()
+            _l2_strategy = "pure_redis"
+            logger.info("L2 semantic cache: pure-Redis fallback strategy active.")
+            return _l2_strategy
+    except Exception as exc:
+        logger.info("Pure-Redis L2 fallback failed: %s", exc)
+
+    # Strategy 3: Disabled
+    _l2_strategy = "disabled"
+    logger.warning("L2 semantic cache disabled (no Redis Stack or FastEmbed available).")
+    return _l2_strategy
 
 
 async def l2_get(query: str) -> Optional[dict]:
     """Look up a semantically similar cached response.
 
-    Uses RedisVL's HNSW vector index to find cached responses whose
-    query embedding is within the configured cosine similarity threshold.
+    Tries RedisVL first (HNSW index), falls back to pure-Redis
+    brute-force cosine similarity if Redis Stack is unavailable.
 
     Args:
         query: The user's query string.
@@ -193,24 +233,74 @@ async def l2_get(query: str) -> Optional[dict]:
     Returns:
         Cached response dict if a semantic match is found, None otherwise.
     """
-    cache = await _get_semantic_cache()
-    if cache is None:
+    strategy = await _init_l2_strategy()
+
+    if strategy == "disabled":
         return None
 
+    if strategy == "redisvl":
+        try:
+            results = _semantic_cache.check(prompt=query)
+            if results:
+                best = results[0]
+                logger.info(
+                    "L2 cache HIT [redisvl] (dist=%.4f) for: %s",
+                    best.get("vector_distance", 0.0),
+                    query[:60],
+                )
+                response_str = best.get("response", "")
+                if response_str:
+                    return json.loads(response_str)
+        except Exception as exc:
+            logger.warning("L2 [redisvl] lookup failed: %s", exc)
+        return None
+
+    # Pure-Redis fallback
     try:
-        results = cache.check(prompt=query)
-        if results:
-            best = results[0]
+        model = _get_l2_embed_model()
+        if model is None:
+            return None
+
+        query_embedding = list(model.embed([query]))[0].tolist()
+        client = await get_redis_client()
+        settings = get_settings()
+        threshold = settings.cache_similarity_threshold
+
+        # Scan pool keys
+        pool_keys = []
+        async for key in client.scan_iter(match=f"{_L2_POOL_PREFIX}:*", count=100):
+            pool_keys.append(key)
+
+        if not pool_keys:
+            return None
+
+        best_score = 0.0
+        best_response = None
+
+        # Batch get all entries
+        for key in pool_keys:
+            try:
+                data = await client.get(key)
+                if data is None:
+                    continue
+                entry = json.loads(data)
+                stored_embedding = entry.get("embedding", [])
+                similarity = _cosine_similarity(query_embedding, stored_embedding)
+                if similarity > best_score:
+                    best_score = similarity
+                    best_response = entry.get("response")
+            except Exception:
+                continue
+
+        if best_score >= threshold and best_response:
             logger.info(
-                "L2 cache HIT (similarity=%.4f) for query: %s",
-                best.get("vector_distance", 0.0),
-                query[:60],
+                "L2 cache HIT [pure_redis] (sim=%.4f) for: %s",
+                best_score, query[:60],
             )
-            response_str = best.get("response", "")
-            if response_str:
-                return json.loads(response_str)
+            return json.loads(best_response) if isinstance(best_response, str) else best_response
+
     except Exception as exc:
-        logger.warning("L2 cache lookup failed: %s", exc)
+        logger.warning("L2 [pure_redis] lookup failed: %s", exc)
 
     return None
 
@@ -218,27 +308,73 @@ async def l2_get(query: str) -> Optional[dict]:
 async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
     """Store a response in the L2 semantic cache.
 
+    Uses RedisVL if available, otherwise falls back to pure-Redis
+    with FastEmbed embeddings.
+
     Args:
-        query: The user's query string (will be embedded for similarity matching).
+        query: The user's query string.
         response: The response dict to cache.
-        ttl: Time-to-live in seconds. Defaults to the static TTL from settings.
+        ttl: Time-to-live in seconds.
     """
-    cache = await _get_semantic_cache()
-    if cache is None:
+    strategy = await _init_l2_strategy()
+
+    if strategy == "disabled":
         return
 
     settings = get_settings()
     effective_ttl = ttl or settings.cache_ttl_static
 
+    if strategy == "redisvl":
+        try:
+            _semantic_cache.store(
+                prompt=query,
+                response=json.dumps(response),
+                metadata={"ttl": effective_ttl},
+            )
+            logger.debug("L2 [redisvl] SET for: %s", query[:60])
+        except Exception as exc:
+            logger.warning("L2 [redisvl] write failed: %s", exc)
+        return
+
+    # Pure-Redis fallback
     try:
-        cache.store(
-            prompt=query,
-            response=json.dumps(response),
-            metadata={"ttl": effective_ttl},
-        )
-        logger.debug("L2 cache SET for query: %s", query[:60])
+        model = _get_l2_embed_model()
+        if model is None:
+            return
+
+        query_embedding = list(model.embed([query]))[0].tolist()
+        client = await get_redis_client()
+
+        # Generate a unique key for this entry
+        entry_key = f"{_L2_POOL_PREFIX}:{hashlib.md5(query.encode()).hexdigest()}"
+        entry_data = json.dumps({
+            "embedding": query_embedding,
+            "response": json.dumps(response),
+            "query": query[:200],
+        })
+
+        await client.setex(entry_key, effective_ttl, entry_data)
+
+        # Enforce pool size cap (evict oldest if over limit)
+        pool_size = 0
+        async for _ in client.scan_iter(match=f"{_L2_POOL_PREFIX}:*", count=100):
+            pool_size += 1
+            if pool_size > _L2_MAX_POOL_SIZE:
+                break
+
+        if pool_size > _L2_MAX_POOL_SIZE:
+            # Evict random entries to stay under cap
+            evict_count = pool_size - _L2_MAX_POOL_SIZE + 10
+            evicted = 0
+            async for key in client.scan_iter(match=f"{_L2_POOL_PREFIX}:*", count=100):
+                if evicted >= evict_count:
+                    break
+                await client.delete(key)
+                evicted += 1
+
+        logger.debug("L2 [pure_redis] SET for: %s", query[:60])
     except Exception as exc:
-        logger.warning("L2 cache write failed: %s", exc)
+        logger.warning("L2 [pure_redis] write failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------

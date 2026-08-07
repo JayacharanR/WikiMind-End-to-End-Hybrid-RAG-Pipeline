@@ -48,8 +48,17 @@ async def fetch_article_text(session: aiohttp.ClientSession, title: str) -> Opti
         "explaintext": "1",
     }
     try:
-        async with session.get(WIKI_API_URL, params=params, timeout=10) as response:
+        req_timeout = aiohttp.ClientTimeout(total=15)
+        async with session.get(WIKI_API_URL, params=params, timeout=req_timeout) as response:
+            if response.status == 403:
+                logger.warning(
+                    "Wikipedia API returned 403 for '%s'. "
+                    "Ensure session has a proper User-Agent header.",
+                    title,
+                )
+                return None
             if response.status != 200:
+                logger.warning("Wikipedia API returned HTTP %d for '%s'.", response.status, title)
                 return None
             data = await response.json()
             pages = data.get("query", {}).get("pages", {})
