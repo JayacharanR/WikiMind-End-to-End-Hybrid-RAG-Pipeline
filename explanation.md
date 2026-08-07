@@ -18,9 +18,11 @@ encountering the project for the first time.
 8. [Evaluation Harness](#evaluation-harness)
 9. [Observability (Langfuse)](#observability-langfuse)
 10. [Custom Observability Dashboard](#custom-observability-dashboard)
-11. [Architecture Diagrams](#architecture-diagrams)
-12. [Benchmark Results](#benchmark-results)
-13. [Key Technical Decisions](#key-technical-decisions)
+11. [PageIndex Tree Navigation](#pageindex-tree-navigation)
+12. [Self-Healing Data Pipeline](#self-healing-data-pipeline)
+13. [Architecture Diagrams](#architecture-diagrams)
+14. [Benchmark Results](#benchmark-results)
+15. [Key Technical Decisions](#key-technical-decisions)
 
 ---
 
@@ -994,4 +996,127 @@ streamlit run frontend/app.py                           # Frontend
 | **Observability Dashboard** | http://localhost:8000/dashboard/ | Custom 5-tab dashboard |
 | **Langfuse** | http://localhost:3000 | LLM traces and eval dashboard |
 | **Qdrant** | http://localhost:6333 | Vector DB dashboard |
+| **Pipeline Health** | http://localhost:8000/api/pipeline-health | Self-healing worker status |
 | **Prometheus Metrics** | http://localhost:8000/metrics | Raw endpoint, no dashboard |
+
+---
+
+## PageIndex Tree Navigation
+
+The **PageIndex** is a vectorless structural navigation system — a third
+retrieval modality alongside dense/sparse vector search and knowledge graph
+traversal. When enabled, it reconstructs the full article text from Qdrant
+chunks, parses the Wikipedia header hierarchy into a Table of Contents (ToC)
+tree, and asks the LLM to reason over the ToC to select the most relevant
+sections for the query.
+
+### How It Works
+
+1. **Article Reconstruction**: For each target article (identified by the
+   article-level index), scrolls all chunks from Qdrant and reconstructs
+   the full article text by concatenating chunks in `chunk_index` order.
+2. **Tree Parsing**: `parse_article_tree()` extracts headers (MediaWiki `==`
+   syntax and Markdown `##` syntax) into a nested JSON tree structure.
+3. **ToC Rendering**: The tree is flattened into a readable ToC string.
+4. **LLM Section Selection**: A ChatOpenAI call receives the ToC and the
+   user query, returning a JSON list of relevant section titles.
+5. **Content Extraction**: The selected sections (including all nested
+   subsections) are extracted and returned as high-priority documents.
+6. **Redis Caching**: Parsed trees are cached in Redis for 24 hours to
+   avoid re-parsing on subsequent queries for the same article.
+
+### Graph Integration
+
+The `page_index_enrich` node runs conditionally after `retrieve` when the
+`page_index` strategy is enabled:
+
+```
+retrieve → [if page_index] → page_index_enrich → grade_documents
+retrieve → [if no page_index] → grade_documents
+```
+
+PageIndex documents are prepended (highest priority) to the existing
+retrieved documents before grading.
+
+### Key Files
+
+| File | Purpose |
+|------|--------|
+| `backend/page_index.py` | Tree parsing, ToC rendering, LLM navigation, Redis caching |
+| `backend/agent.py` | `node_page_index` function and `route_after_retrieve` conditional edge |
+| `backend/models.py` | `page_index: bool` field in `QueryStrategies` |
+
+---
+
+## Self-Healing Data Pipeline
+
+The data pipeline workers (`wiki_updater.py` and `reconciler.py`) are designed
+for **autonomous recovery** — they never exit fatally, persist failed events
+for later retry, and expose health metrics for external monitoring.
+
+### Dead Letter Queue (DLQ)
+
+Events that fail processing are stored in a Dead Letter Queue instead of being
+silently dropped:
+
+1. **In-Memory Ring Buffer**: Capped at 1,000 entries (deque)
+2. **JSON Disk Persistence**: Written to `data/dlq_<worker>.json` after
+   each addition and on graceful shutdown
+3. **Automatic Retry**: Every 100 successfully processed events, the updater
+   retries all DLQ items. The reconciler retries DLQ at the end of each cycle.
+4. **Max Retries**: After 3 failed retry attempts, an item is permanently
+   discarded with a CRITICAL alert log.
+
+### Self-Healing Behaviors
+
+| Behavior | wiki_updater | reconciler |
+|----------|-------------|------------|
+| **Never exits fatally** | Capped exponential backoff (max 5 min) | Continuous loop with interval |
+| **Error isolation** | Per-event try/except with DLQ | Per-title try/except with DLQ |
+| **Graceful shutdown** | SIGTERM/SIGINT handler flushes DLQ | N/A (loop-based) |
+| **Heartbeat** | Updated on each successful event | Updated on each cycle completion |
+| **Consecutive failure alerting** | WARNING at 5, CRITICAL at 20 | Same thresholds |
+
+### Drift Metrics (Reconciler)
+
+The reconciler tracks per-cycle stats:
+- `drift_detected`: Number of articles with stale revisions
+- `reingestion_success`: Articles successfully re-ingested
+- `reingestion_failed`: Articles that failed re-ingestion (sent to DLQ)
+
+### Health API
+
+`GET /api/pipeline-health` returns structured health for both workers:
+
+```json
+{
+  "status": "healthy",
+  "workers": [
+    {
+      "worker": "wiki-updater",
+      "status": "healthy",
+      "events_processed": 1234,
+      "events_failed": 3,
+      "dlq_size": 1,
+      "last_heartbeat": "2026-08-07T17:00:00Z",
+      "consecutive_failures": 0
+    },
+    {
+      "worker": "reconciler",
+      "status": "healthy",
+      "drift_detected": 15,
+      "reingestion_success": 14,
+      "last_cycle": { "drift_detected": 3, "elapsed_sec": 12.4 }
+    }
+  ]
+}
+```
+
+### Key Files
+
+| File | Purpose |
+|------|--------|
+| `data_pipeline/pipeline_health.py` | `PipelineHealthTracker` class — DLQ, heartbeats, alerting, persistence |
+| `data_pipeline/wiki_updater.py` | EventStreams listener with DLQ, capped backoff, periodic retry |
+| `data_pipeline/reconciler.py` | Drift detection with per-title error isolation and cycle metrics |
+| `backend/main.py` | `/api/pipeline-health` endpoint |

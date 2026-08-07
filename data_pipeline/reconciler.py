@@ -12,17 +12,21 @@ import asyncio
 import logging
 import random
 import time
-from typing import List, Tuple
+from typing import Any, Dict, List
 
 import aiohttp
 
 from backend.config import get_settings
 from backend.llmops import get_langfuse_client
 from backend.qdrant_client import get_async_qdrant
+from data_pipeline.pipeline_health import PipelineHealthTracker
 from data_pipeline.wiki_updater import process_event
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
+
+# Global health tracker
+reconciler_health = PipelineHealthTracker(name="reconciler")
 
 # Constants
 WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
@@ -173,7 +177,13 @@ async def _get_stored_revision(title: str) -> str:
 
 
 async def run_reconciliation_cycle():
+    """Run a single reconciliation cycle with error isolation and drift metrics."""
     logger.info("Beginning reconciliation cycle...")
+    cycle_start = time.time()
+    drift_count = 0
+    success_count = 0
+    failed_count = 0
+
     try:
         titles = await get_random_titles_from_qdrant(limit=SAMPLE_SIZE)
         if not titles:
@@ -185,16 +195,51 @@ async def run_reconciliation_cycle():
         headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
         async with aiohttp.ClientSession(headers=headers) as session:
             stale_titles = await check_live_revisions(session, titles)
+            drift_count = len(stale_titles)
             
             if stale_titles:
                 logger.warning("Detected drift in %d articles. Re-ingesting...", len(stale_titles))
                 for title in stale_titles:
                     fake_event = {"title": title, "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"}}
-                    await process_event(fake_event, session)
+                    try:
+                        await process_event(fake_event, session)
+                        success_count += 1
+                        reconciler_health.record_success(event_id=title)
+                        logger.info("Re-ingestion succeeded for '%s'", title)
+                    except Exception as exc:
+                        failed_count += 1
+                        reconciler_health.add_to_dlq(
+                            event=fake_event, error_msg=str(exc)
+                        )
+                        logger.warning("Re-ingestion failed for '%s': %s", title, exc)
             else:
                 logger.info("No drift detected in sample.")
+
+        # Retry any DLQ items from previous cycles
+        if reconciler_health.dlq:
+            logger.info("Retrying %d DLQ items from previous cycles...", len(reconciler_health.dlq))
+            async with aiohttp.ClientSession(headers=headers) as retry_session:
+                await reconciler_health.retry_dlq(
+                    process_fn=process_event,
+                    session=retry_session,
+                )
+
     except Exception as exc:
+        reconciler_health.record_failure(error=str(exc))
         logger.error("Reconciliation cycle failed: %s", exc)
+
+    # Record cycle metrics
+    elapsed = time.time() - cycle_start
+    reconciler_health.record_cycle_stats(
+        drift_count=drift_count,
+        success_count=success_count,
+        failed_count=failed_count,
+        elapsed_sec=elapsed,
+    )
+    logger.info(
+        "Reconciliation cycle complete: drift=%d, success=%d, failed=%d, elapsed=%.1fs",
+        drift_count, success_count, failed_count, elapsed,
+    )
 
 
 async def reconcile_loop():
@@ -219,6 +264,11 @@ async def reconcile_loop():
         sleep_time = max(0, interval_seconds - elapsed)
         logger.info("Reconciliation cycle complete (took %.1fs). Sleeping for %.1fh...", elapsed, sleep_time / 3600)
         await asyncio.sleep(sleep_time)
+
+
+def get_reconciler_health() -> Dict[str, Any]:
+    """Return the health status of the reconciler worker."""
+    return reconciler_health.get_health_status()
 
 
 if __name__ == "__main__":

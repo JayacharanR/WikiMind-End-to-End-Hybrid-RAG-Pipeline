@@ -135,26 +135,36 @@ def _get_full_section_content(node: Dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 
 async def _get_cached_tree(article_title: str) -> Optional[Dict[str, Any]]:
-    """Retrieve a parsed article tree from Redis L1 cache."""
-    client = await get_redis_client()
-    key = f"wikimind:pageindex:{article_title}"
+    """Retrieve a parsed article tree from Redis L1 cache.
+
+    Returns None gracefully if Redis is unavailable.
+    """
     try:
+        client = await get_redis_client()
+        if client is None:
+            return None
+        key = f"wikimind:pageindex:{article_title}"
         data = await client.get(key)
         if data:
             return json.loads(data)
     except Exception as exc:
-        logger.warning("Failed to get cached PageIndex tree for %s: %s", article_title, exc)
+        logger.debug("Redis PageIndex cache miss for %s: %s", article_title, exc)
     return None
 
 
 async def _set_cached_tree(article_title: str, tree: Dict[str, Any]) -> None:
-    """Store a parsed article tree in Redis L1 cache (24h TTL)."""
-    client = await get_redis_client()
-    key = f"wikimind:pageindex:{article_title}"
+    """Store a parsed article tree in Redis L1 cache (24h TTL).
+
+    Silently skips if Redis is unavailable.
+    """
     try:
+        client = await get_redis_client()
+        if client is None:
+            return
+        key = f"wikimind:pageindex:{article_title}"
         await client.setex(key, 86400, json.dumps(tree))
     except Exception as exc:
-        logger.warning("Failed to cache PageIndex tree for %s: %s", article_title, exc)
+        logger.debug("Failed to cache PageIndex tree for %s: %s", article_title, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -193,8 +203,8 @@ async def navigate_article(query: str, article_title: str, markdown_text: str) -
     llm = ChatOpenAI(
         model=settings.openrouter_model,
         api_key=settings.openrouter_api_key,
-        base_url="https://openrouter.ai/api/v1",
-        temperature=0.0
+        base_url=settings.llm_base_url,
+        temperature=0.0,
     )
     
     chain = NAVIGATE_PROMPT | llm

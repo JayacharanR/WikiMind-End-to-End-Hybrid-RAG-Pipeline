@@ -547,3 +547,34 @@ async def api_eval_results():
         except Exception:
             continue
     return {"results": results[:10]}  # last 10 benchmark runs
+
+
+@app.get("/api/pipeline-health")
+async def api_pipeline_health():
+    """Return health status of data pipeline workers (updater + reconciler).
+
+    Exposes DLQ sizes, heartbeat timestamps, event counts, drift metrics,
+    and consecutive failure counts for monitoring self-healing behavior.
+    """
+    workers = []
+
+    try:
+        from data_pipeline.wiki_updater import get_updater_health
+        workers.append(get_updater_health())
+    except Exception as exc:
+        workers.append({"worker": "wiki-updater", "status": "unavailable", "error": str(exc)})
+
+    try:
+        from data_pipeline.reconciler import get_reconciler_health
+        workers.append(get_reconciler_health())
+    except Exception as exc:
+        workers.append({"worker": "reconciler", "status": "unavailable", "error": str(exc)})
+
+    overall = "healthy"
+    for w in workers:
+        if w.get("status") == "degraded":
+            overall = "degraded"
+            break
+
+    return {"status": overall, "workers": workers}
+

@@ -39,6 +39,8 @@ USER appuser
 # Copy application code
 COPY --chown=appuser:appuser ./backend /app/backend
 COPY --chown=appuser:appuser ./data_pipeline /app/data_pipeline
+COPY --chown=appuser:appuser ./dashboard /app/dashboard
+COPY --chown=appuser:appuser ./evaluation /app/evaluation
 
 EXPOSE 8000
 

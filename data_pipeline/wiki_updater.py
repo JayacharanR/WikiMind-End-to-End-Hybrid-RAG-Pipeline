@@ -4,13 +4,15 @@ Connects to the Wikimedia EventStreams SSE API to listen for live edits to
 the English Wikipedia in real-time. Fetches the updated article content via
 the MediaWiki API, chunks, embeds, and performs idempotent upserts into Qdrant.
 
-Implements exponential backoff, a Redis-backed dead letter queue (DLQ) for
-failed events, and offset tracking to recover missed events after a crash.
+Implements exponential backoff with a cap, a Dead Letter Queue (DLQ) for
+persistently failed events, periodic DLQ retry, heartbeat tracking, and
+graceful shutdown with DLQ persistence.
 """
 
 import asyncio
 import json
 import logging
+import signal
 from typing import Any, Dict, Optional
 
 import aiohttp
@@ -19,6 +21,7 @@ from sse_starlette.sse import ServerSentEvent
 from backend.config import get_settings
 from backend.qdrant_client import generate_point_id, get_async_qdrant
 from data_pipeline.ingest import get_dense_model, get_sparse_model
+from data_pipeline.pipeline_health import PipelineHealthTracker
 from qdrant_client.http import models
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
@@ -27,8 +30,12 @@ logger = logging.getLogger(__name__)
 
 # Constants
 WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
-MAX_RETRIES = 5
+MAX_BACKOFF = 300  # 5 minute cap on exponential backoff
 BASE_BACKOFF = 2.0
+DLQ_RETRY_INTERVAL = 100  # retry DLQ every N events processed
+
+# Global health tracker
+updater_health = PipelineHealthTracker(name="wiki-updater")
 
 
 async def fetch_article_text(session: aiohttp.ClientSession, title: str) -> Optional[str]:
@@ -157,7 +164,14 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
 
 
 async def listen_to_stream():
-    """Main event loop listening to Wikimedia EventStreams."""
+    """Main event loop listening to Wikimedia EventStreams.
+
+    Self-healing features:
+    - Exponential backoff with a 5-minute cap (never exits fatally)
+    - DLQ for failed event processing with periodic retry
+    - Heartbeat tracking for external health monitoring
+    - Graceful shutdown on SIGTERM/SIGINT (flushes DLQ to disk)
+    """
     settings = get_settings()
     stream_url = settings.wiki_stream_url
     
@@ -165,10 +179,22 @@ async def listen_to_stream():
     from backend.qdrant_client import init_collection
     # Run sync init_collection in thread
     await asyncio.to_thread(init_collection)
+
+    # Graceful shutdown handler
+    shutdown_event = asyncio.Event()
+
+    def _handle_shutdown(signum, frame):
+        logger.info("Received signal %s. Initiating graceful shutdown...", signum)
+        updater_health._save_dlq()
+        shutdown_event.set()
+
+    signal.signal(signal.SIGTERM, _handle_shutdown)
+    signal.signal(signal.SIGINT, _handle_shutdown)
     
     retry_count = 0
+    events_since_dlq_retry = 0
     
-    while True:
+    while not shutdown_event.is_set():
         try:
             logger.info("Connecting to Wikimedia EventStreams...")
             headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
@@ -176,12 +202,15 @@ async def listen_to_stream():
                 async with session.get(stream_url, headers={"Accept": "text/event-stream"}) as response:
                     if response.status != 200:
                         logger.error("Failed to connect: HTTP %d", response.status)
-                        raise Exception("Connection failed")
+                        raise Exception(f"Connection failed: HTTP {response.status}")
                         
-                    retry_count = 0 # reset on successful connection
+                    retry_count = 0  # reset on successful connection
                     logger.info("Connected successfully. Listening for events...")
                     
                     async for line in response.content:
+                        if shutdown_event.is_set():
+                            break
+
                         line = line.decode('utf-8').strip()
                         if line.startswith("data: "):
                             data_str = line[6:]
@@ -192,23 +221,58 @@ async def listen_to_stream():
                                     event.get("namespace") == 0 and
                                     event.get("type") == "edit"):
                                     
-                                    # Process event
-                                    await process_event(event, session)
+                                    # Process event with DLQ error handling
+                                    try:
+                                        await process_event(event, session)
+                                        updater_health.record_success(
+                                            event_id=event.get("title", "")
+                                        )
+                                        events_since_dlq_retry += 1
+                                    except Exception as e:
+                                        updater_health.add_to_dlq(
+                                            event=event, error_msg=str(e)
+                                        )
+
+                                    # Periodic DLQ retry
+                                    if events_since_dlq_retry >= DLQ_RETRY_INTERVAL:
+                                        events_since_dlq_retry = 0
+                                        if updater_health.dlq:
+                                            logger.info(
+                                                "Periodic DLQ retry (%d items)...",
+                                                len(updater_health.dlq),
+                                            )
+                                            await updater_health.retry_dlq(
+                                                process_fn=process_event,
+                                                session=session,
+                                            )
                                     
                             except json.JSONDecodeError:
                                 continue
-                            except Exception as e:
-                                logger.error("Error processing event: %s", e)
                                 
         except Exception as e:
             retry_count += 1
-            if retry_count > MAX_RETRIES:
-                logger.critical("Max retries exceeded. Fatal error.")
-                break
-                
-            sleep_time = BASE_BACKOFF ** retry_count
-            logger.warning("Stream disconnected. Retrying in %.1fs... (%s)", sleep_time, e)
+            # Capped exponential backoff (never exits fatally)
+            sleep_time = min(BASE_BACKOFF ** retry_count, MAX_BACKOFF)
+            updater_health.record_failure(error=str(e))
+            logger.warning(
+                "Stream disconnected (attempt %d). Retrying in %.1fs... (%s)",
+                retry_count, sleep_time, e,
+            )
             await asyncio.sleep(sleep_time)
+
+    # Final DLQ flush on shutdown
+    updater_health._save_dlq()
+    logger.info(
+        "Wiki updater stopped. Processed: %d, Failed: %d, DLQ: %d",
+        updater_health.events_processed,
+        updater_health.events_failed,
+        len(updater_health.dlq),
+    )
+
+
+def get_updater_health() -> Dict[str, Any]:
+    """Return the health status of the wiki updater worker."""
+    return updater_health.get_health_status()
 
 
 if __name__ == "__main__":

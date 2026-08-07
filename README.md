@@ -64,6 +64,8 @@ graph TD
 | **Safe Generation** | NeMo Guardrails for jailbreak detection, topic filtering, and output safety — wired into generation with automatic fallback | NeMo Guardrails |
 | **RAG Provenance** | Inline `[N]` citations with key-term overlap verification. Produces a `provenance_score` (0.0–1.0) per query | Custom |
 | **Attribution Detection** | Context-ablation LLM call to distinguish RAG-grounded answers from LLM parametric knowledge | Custom |
+| **PageIndex Navigation** | Vectorless structural article navigation: reconstructs articles from chunks, parses ToC, LLM selects relevant sections | Custom |
+| **Self-Healing Pipeline** | DLQ with disk persistence, capped exponential backoff, per-event error isolation, heartbeat tracking, `/api/pipeline-health` | Custom |
 | **Full Observability** | Self-hosted Langfuse for LLM traces + custom 5-tab dashboard for KPIs, guardrails, and evaluation results | Langfuse, Chart.js |
 
 ## Project Structure
@@ -71,7 +73,7 @@ graph TD
 ```
 wikimind/
 |-- backend/
-|   |-- agent.py              # LangGraph state machine (10 nodes)
+|   |-- agent.py              # LangGraph state machine (11 nodes)
 |   |-- article_index.py      # Stage 1: article-level retrieval
 |   |-- knowledge_graph.py    # spaCy NER + NetworkX graph + Redis
 |   |-- retrieval.py          # Stage 2: hybrid search + time-travel
@@ -86,8 +88,9 @@ wikimind/
 |   +-- guardrails_config/    # NeMo Guardrails configuration
 |-- data_pipeline/
 |   |-- ingest.py             # Batch ingestion with entity extraction
-|   |-- wiki_updater.py       # Live SSE listener with version-aware upserts
-|   |-- reconciler.py         # Revision comparison drift detection
+|   |-- wiki_updater.py       # Live SSE listener with DLQ and self-healing
+|   |-- reconciler.py         # Drift detection with per-title error isolation
+|   |-- pipeline_health.py    # PipelineHealthTracker, DLQ, heartbeats, alerting
 |   +-- graph_builder.py      # Knowledge graph builder from Qdrant chunks
 |-- evaluation/
 |   |-- harness.py            # CLI benchmark runner
@@ -209,6 +212,10 @@ Returns the last N query traces with full detail for the dashboard trace explore
 ### `GET /api/eval-results`
 
 Returns evaluation benchmark results from `evaluation/results/`.
+
+### `GET /api/pipeline-health`
+
+Returns health status of data pipeline workers (wiki-updater and reconciler) including DLQ sizes, heartbeats, drift metrics, and failure counts.
 
 ## Tech Stack
 

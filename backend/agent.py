@@ -21,6 +21,7 @@ from backend.article_index import search_articles
 from backend.config import get_settings
 from backend.llmops import get_langfuse_handler, safe_generate
 from backend.models import QueryStrategies
+from backend.page_index import navigate_article
 from backend.query_expansion import expand_query
 from backend.retrieval import extract_title_from_wikipedia_url, hybrid_search
 
@@ -210,6 +211,110 @@ async def node_retrieve(state: AgentState) -> Dict:
         final_docs = state["web_snippets"][:settings.max_generation_docs]
 
     return {"documents": final_docs, "steps": steps}
+
+
+async def node_page_index(state: AgentState) -> Dict:
+    """Node: Enrich retrieval with PageIndex tree navigation.
+
+    For each target article, reconstructs the full article text from Qdrant
+    chunks, then uses LLM-driven Table of Contents reasoning to extract the
+    most relevant sections. The extracted content is injected as additional
+    high-priority documents before grading.
+
+    Only runs when the ``page_index`` strategy is enabled.
+    """
+    query = state["query"]
+    target_articles = state.get("target_articles", [])
+    documents = state.get("documents", [])
+    steps = state.get("steps", 0) + 1
+
+    logger.info("--- NODE: PAGE INDEX (step %d) ---", steps)
+
+    if not target_articles:
+        logger.info("PageIndex: no target articles, skipping.")
+        return {"steps": steps}
+
+    # Reconstruct full article text from existing retrieved chunks
+    # Group chunks by title from the already-retrieved documents
+    from backend.qdrant_client import get_async_qdrant
+    from qdrant_client.http import models as qmodels
+    settings = get_settings()
+    qdrant = get_async_qdrant()
+
+    page_index_docs = []
+
+    for article_title in target_articles[:3]:  # Cap at 3 articles to limit LLM calls
+        try:
+            # Scroll all chunks for this article, sorted by chunk_index
+            all_chunks = []
+            offset = None
+            while True:
+                results, next_offset = await qdrant.scroll(
+                    collection_name=settings.qdrant_collection,
+                    scroll_filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="title",
+                                match=qmodels.MatchValue(value=article_title),
+                            ),
+                            qmodels.FieldCondition(
+                                key="is_current",
+                                match=qmodels.MatchValue(value=True),
+                            ),
+                        ]
+                    ),
+                    limit=200,
+                    offset=offset,
+                    with_payload=["page_content", "chunk_index"],
+                    with_vectors=False,
+                )
+
+                for pt in results:
+                    all_chunks.append({
+                        "chunk_index": pt.payload.get("chunk_index", 0),
+                        "content": pt.payload.get("page_content", ""),
+                    })
+
+                offset = next_offset
+                if offset is None or not results:
+                    break
+
+            if not all_chunks:
+                logger.debug("PageIndex: no chunks found for '%s'", article_title)
+                continue
+
+            # Sort by chunk_index and reconstruct full text
+            all_chunks.sort(key=lambda c: c["chunk_index"])
+            full_text = "\n".join(c["content"] for c in all_chunks)
+
+            # Navigate the article using LLM-driven ToC reasoning
+            extracted = await navigate_article(query, article_title, full_text)
+
+            if extracted and extracted.strip():
+                page_index_docs.append({
+                    "id": f"pageindex-{article_title}",
+                    "title": article_title,
+                    "content": extracted[:2000],  # Cap section content
+                    "url": f"https://en.wikipedia.org/wiki/{article_title.replace(' ', '_')}",
+                    "score": 1.0,  # High priority
+                    "source": "page_index",
+                })
+                logger.info(
+                    "PageIndex extracted %d chars from '%s'",
+                    len(extracted), article_title,
+                )
+
+        except Exception as exc:
+            logger.warning("PageIndex failed for '%s': %s", article_title, exc)
+
+    if page_index_docs:
+        # Prepend PageIndex results (highest priority) to existing documents
+        merged = page_index_docs + documents
+        logger.info("PageIndex added %d enrichment documents.", len(page_index_docs))
+        return {"documents": merged, "steps": steps}
+
+    logger.info("PageIndex produced no additional documents.")
+    return {"steps": steps}
 
 
 async def node_grade_documents(state: AgentState) -> Dict:
@@ -730,6 +835,7 @@ def compile_agent_graph():
     workflow.add_node("identify_articles", node_identify_articles)
     workflow.add_node("graph_search", node_graph_search)
     workflow.add_node("retrieve", node_retrieve)
+    workflow.add_node("page_index_enrich", node_page_index)
     workflow.add_node("grade_documents", node_grade_documents)
     workflow.add_node("generate_from_web", node_generate_from_web)
     workflow.add_node("generate", node_generate)
@@ -742,7 +848,7 @@ def compile_agent_graph():
     # Standard edges
     workflow.add_edge("expand_query", "identify_articles")
     workflow.add_edge("graph_search", "retrieve")
-    workflow.add_edge("retrieve", "grade_documents")
+    workflow.add_edge("page_index_enrich", "grade_documents")
     workflow.add_edge("generate_from_web", END)
     workflow.add_edge("generate", "check_hallucination")
 
@@ -760,6 +866,23 @@ def compile_agent_graph():
         {
             "graph_search": "graph_search",
             "retrieve": "retrieve",
+        },
+    )
+
+    # Conditional: after retrieve, optionally run page_index enrichment
+    def route_after_retrieve(state: AgentState) -> Literal["page_index_enrich", "grade_documents"]:
+        """Route to page_index_enrich if the page_index strategy is active."""
+        strategies = state.get("active_strategies")
+        if strategies and getattr(strategies, "page_index", False):
+            return "page_index_enrich"
+        return "grade_documents"
+
+    workflow.add_conditional_edges(
+        "retrieve",
+        route_after_retrieve,
+        {
+            "page_index_enrich": "page_index_enrich",
+            "grade_documents": "grade_documents",
         },
     )
 
