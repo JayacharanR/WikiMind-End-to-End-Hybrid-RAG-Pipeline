@@ -1,235 +1,207 @@
-# WikiMind: End-to-End Agentic Hybrid RAG Pipeline
+# WikiMind — End-to-End Hybrid RAG Pipeline
 
-WikiMind is an end-to-end Agentic Hybrid RAG pipeline built on the complete English Wikipedia dataset. It features two-stage local retrieval, a self-healing knowledge base synced with live Wikipedia edits, entity-based knowledge graph traversal, citation-aware generation with diagnostic verification, an automated evaluation harness, and a multi-page Streamlit dashboard — all orchestrated by a LangGraph CRAG/Self-RAG state machine.
+WikiMind is a portfolio-grade question-answering system grounded in English
+Wikipedia. It demonstrates batch ingestion, latest-state synchronization,
+two-stage hybrid retrieval, citation-aware generation, evaluation,
+observability, and a Streamlit interface.
+
+The project stores the latest indexed state of each article. Historical
+versions are intentionally not retained. If an answer cannot be verified from
+retrieved evidence, the agent abstains.
 
 ## Architecture
 
 ```mermaid
-graph TD
-    subgraph Data Pipeline
-        A[Wikipedia EventStreams] --> B(Wiki Updater Worker)
-        C[Wikipedia Dataset] --> D(Batch Ingestor)
-        B --> E[(Qdrant Vector DB)]
-        D --> E
-        D --> F[(Article Index)]
-        D --> G(Entity Extraction)
-        G --> H[(Knowledge Graph - Redis)]
-        I(State Reconciler) -.-> E
-        I -.-> A
-    end
-
-    subgraph Retrieval Engine
-        J[User Query] --> K(Two-Stage Article Discovery)
-        K --> L{Knowledge Graph?}
-        L -->|Enabled| M(Graph Traversal)
-        M --> N(Article-Scoped Hybrid Search)
-        L -->|Disabled| N
-        N --> O(RRF and Cross-Encoder Reranker)
-        O --> P(PageIndex Tree Nav)
-    end
-
-    subgraph Query Expansion
-        J --> Q{Expansion Strategy}
-        Q -->|Multi-Query| R(Semantic Reformulations)
-        Q -->|HyDE| S(Hypothetical Document)
-        Q -->|Step-Back| T(Abstract Query)
-        Q -->|Decomposition| U(Sub-Questions)
-        R & S & T & U --> K
-    end
-
-    subgraph Orchestration
-        P --> V[LangGraph Agent]
-        V --> W{Guardrails}
-        W -->|Hallucination| V
-        W -->|Bad Answer| Q
-        W -->|Pass| X[FastAPI Backend]
-    end
-
-    X --> Y[Streamlit Multi-Page UI]
-    X --> Z[POST /chat/compare]
+flowchart TD
+    A[Wikipedia snapshot] --> B[Batch ingestion]
+    C[Wikimedia EventStreams] --> D[Live updater]
+    D --> E[Latest-state Qdrant collections]
+    B --> E
+    F[Reconciler] --> D
+    G[User query] --> H[L1/L2 cache]
+    H -->|miss| I[Query expansion]
+    I --> J[Article discovery]
+    J --> K[Optional graph/PageIndex enrichment]
+    K --> L[Dense + sparse retrieval]
+    L --> M[RRF + FlashRank]
+    M --> N[Document grading]
+    N --> O[LLM generation with citations]
+    O --> P[Grounding/citation gate]
+    P --> Q[Quality and attribution checks]
+    Q --> R[SSE/API response]
 ```
 
-## Features
+## Core behavior
 
-| Feature | Description | Tech |
-|---------|-------------|------|
-| **Two-Stage Hybrid Retrieval** | Local article-level index for discovery, then article-scoped Dense + Sparse (BM25) + RRF + Cross-Encoder search | Qdrant, FastEmbed, FlashRank |
-| **Knowledge Graph Traversal** | spaCy NER extracts entities from chunks; NetworkX co-occurrence graph enables multi-hop reasoning | spaCy, NetworkX, Redis |
-| **Latest-State Sync** | Live Wikipedia edits trigger atomic chunk replacement (delete-then-upsert) with article-index refresh. Reconciler detects drift. | aiohttp, MediaWiki API |
-| **Agentic Loops** | LangGraph state machine with CRAG grading, Self-RAG hallucination detection, and conditional graph search routing | LangGraph, LangChain |
-| **Query Expansion** | Parallel strategies: Multi-Query, HyDE, Step-Back Abstraction, Query Decomposition | LangChain, OpenAI |
-| **Evaluation Harness** | Automated benchmarking with Recall@K, MRR, Answer Accuracy, and latency percentiles against NQ and TriviaQA | HuggingFace Datasets |
-| **A/B Dashboard** | Side-by-side strategy comparison (single-query and batch CSV) with metrics visualization | Streamlit |
-| **Safe Generation** | NeMo Guardrails for jailbreak detection, topic filtering, and output safety — wired into generation with automatic fallback | NeMo Guardrails |
-| **RAG Provenance** | Inline `[N]` citations with key-term overlap verification. Produces a `provenance_score` (0.0–1.0) per query | Custom |
-| **Attribution Detection** | Context-ablation LLM call to distinguish RAG-grounded answers from LLM parametric knowledge | Custom |
-| **PageIndex Navigation** | Vectorless structural article navigation: reconstructs articles from chunks, parses ToC, LLM selects relevant sections | Custom |
-| **Self-Healing Pipeline** | DLQ with disk persistence, capped exponential backoff, per-event error isolation, heartbeat tracking, `/api/pipeline-health` | Custom |
-| **Full Observability** | Self-hosted Langfuse for LLM traces + custom 5-tab dashboard for KPIs, guardrails, and evaluation results | Langfuse, Chart.js |
+### Retrieval
 
-## Project Structure
+- Stage 1 searches one dense vector per article.
+- Stage 2 searches only discovered articles with dense and sparse vectors.
+- Qdrant performs Reciprocal Rank Fusion; FlashRank reranks candidates.
+- Optional Multi-Query, HyDE, Step-Back, Decomposition, PageIndex, and
+  knowledge-graph strategies are enabled per request.
 
-```
-wikimind/
-|-- backend/
-|   |-- agent.py              # LangGraph state machine (11 nodes)
-|   |-- article_index.py      # Stage 1: article-level retrieval
-|   |-- knowledge_graph.py    # spaCy NER + NetworkX graph + Redis
-|   |-- retrieval.py          # Stage 2: hybrid search with typed status
-|   |-- query_expansion.py    # Multi-Query, HyDE, Step-Back, Decomposition
-|   |-- page_index.py         # Vectorless structural navigation
-|   |-- cache.py              # Redis dual-layer cache with strategy-aware keys
-|   |-- main.py               # FastAPI app with /chat, /chat/compare, /health
-|   |-- models.py             # Pydantic request/response schemas
-|   |-- config.py             # Settings management
-|   |-- llmops.py             # Langfuse integration
-|   |-- qdrant_client.py      # Collection initialization
-|   +-- guardrails_config/    # NeMo Guardrails configuration
-|-- data_pipeline/
-|   |-- ingest.py             # Batch ingestion with entity extraction
-|   |-- wiki_updater.py       # Live SSE listener with DLQ and self-healing
-|   |-- reconciler.py         # Drift detection with per-title error isolation
-|   |-- pipeline_health.py    # PipelineHealthTracker, DLQ, heartbeats, alerting
-|   +-- graph_builder.py      # Knowledge graph builder from Qdrant chunks
-|-- evaluation/
-|   |-- harness.py            # CLI benchmark runner
-|   |-- metrics.py            # Recall@K, MRR, accuracy, latency
-|   |-- datasets.py           # NQ + TriviaQA loaders with caching
-|   |-- report.py             # Markdown + JSON report generator
-|   +-- configs/              # Preset configurations (baseline, no_reranker, with_expansion)
-|-- frontend/
-|   |-- app.py                # Multi-page Streamlit app entry point
-|   +-- pages/
-|       |-- ab_dashboard.py   # A/B strategy comparison
-|       +-- eval_results.py   # Evaluation results browser
-|-- monitoring/               # Observability strategy documentation
-|-- dashboard/
-|   |-- index.html            # Custom observability dashboard (5 tabs)
-|   |-- css/dashboard.css     # Design system (dark/light mode)
-|   +-- js/                   # Modular ES modules (app, api, charts, traces, etc.)
-|-- docker-compose.yml
-|-- pyproject.toml
-+-- Makefile
+### Freshness and latest-state consistency
+
+- Batch ingestion stores `source_document_id` and `revision_source`.
+- Live updates upsert deterministic new chunk IDs first, then remove stale IDs.
+- Empty and deleted articles remove their chunk and article-index entries.
+- Local Qdrant supports the same delete operations as remote mode.
+- Redis knowledge-base generation invalidates answer caches after updates.
+- The reconciler uses valid Qdrant cursors and reservoir sampling.
+- Failed events enter a persisted, bounded dead-letter queue.
+
+### Grounding and safety
+
+- Factual claims must use valid `[N]` references.
+- Out-of-range citations are rejected.
+- Grounding-check failures fail closed.
+- Ungrounded answers become abstentions after the retry budget.
+- Retrieved text is explicitly marked as untrusted evidence.
+- Optional `API_KEY`, rate limiting, and request deadlines protect chat routes.
+
+## Repository layout
+
+```text
+backend/                FastAPI API and LangGraph RAG pipeline
+data_pipeline/          Ingestion, live updater, reconciler, DLQ, graph builder
+evaluation/              NQ/TriviaQA benchmark harness and reports
+frontend/                Streamlit chat and evaluation pages
+dashboard/               Static observability dashboard
+tests/                   Automated regression tests
+docker-compose.yml       Backend, frontend, workers, Qdrant, Redis, Langfuse
+pyproject.toml           Runtime and development dependencies
 ```
 
-## Quick Start
+## Local setup
 
-### Prerequisites
+Prerequisites: Python 3.11–3.13. Docker is optional for small local tests, but
+recommended for the populated corpus because embedded Qdrant is not intended
+for large collections.
 
-- Python 3.11+
-- Docker and Docker Compose
-- API Keys: OpenAI (required), Langfuse (optional)
-
-### Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/JayacharanR/WikiMind-End-to-End-Hybrid-RAG-Pipeline.git
-   cd WikiMind-End-to-End-Hybrid-RAG-Pipeline
-   ```
-
-2. Copy `.env.example` to `.env` and fill in your API keys:
-   ```bash
-   cp .env.example .env
-   ```
-
-3. Start the entire stack:
-   ```bash
-   make dev
-   ```
-
-4. Access the application:
-    - Streamlit UI: `http://localhost:8501`
-    - FastAPI Docs: `http://localhost:8000/docs`
-    - Observability Dashboard: `http://localhost:8000/dashboard/`
-    - Langfuse: `http://localhost:3000` (admin@wikimind.local / wikimind-admin)
-
-### Build the Knowledge Graph
-
-After ingesting data, build the entity co-occurrence graph:
-
-```bash
-python -m data_pipeline.graph_builder
+```powershell
+py -3.11 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -e ".[dev]"
+python -m spacy download en_core_web_sm
+Copy-Item .env.example .env
 ```
 
-### Run Evaluations
+Set `OPENROUTER_API_KEY` in `.env`. Embeddings are local and do not require
+an embedding API key. The default local Qdrant path is
+`data/qdrant_storage`.
 
-Benchmark the pipeline against Natural Questions or TriviaQA:
+Use `QDRANT_MODE=local` when you want the embedded store at
+`data/qdrant_storage`. Use `QDRANT_MODE=remote` with `QDRANT_URL` when using
+the Docker Qdrant service. These are separate stores; switching modes does
+not expose the other store's data.
 
-```bash
-python -m evaluation.harness --dataset nq --subset 50
-python -m evaluation.harness --dataset triviaqa --subset 100 --config evaluation/configs/with_expansion.json
+### Local run
+
+```powershell
+python -m data_pipeline.ingest --max 1000 --batch 50
+uvicorn backend.main:app --reload --port 8000
+streamlit run frontend/app.py
 ```
 
-## API Reference
+Use `--max 0` for an unlimited snapshot ingestion. This requires substantial
+time and storage. Checkpoints advance only after Qdrant acknowledges a batch.
+
+### Docker run
+
+```powershell
+docker compose up -d --build
+```
+
+The compose file starts the backend, Streamlit frontend, updater, reconciler,
+Qdrant, Redis Stack, Langfuse, and PostgreSQL. Image tags can be overridden
+with `QDRANT_IMAGE`, `REDIS_IMAGE`, `LANGFUSE_IMAGE`, and
+`POSTGRES_IMAGE`.
+
+## API
 
 ### `POST /chat`
 
-Streams the agent's thought process and final answer via SSE.
+Returns SSE progress events and a final answer event.
 
 ```json
 {
   "query": "What is the capital of France?",
   "strategies": {
-    "multi_query": true,
+    "multi_query": false,
     "hyde": false,
     "step_back": false,
     "decomposition": false,
     "page_index": false,
-    "knowledge_graph": true
+    "knowledge_graph": false
   }
 }
 ```
 
+Final metadata includes `retrieval_status`,
+`article_discovery_status`, `provenance_score`, `attribution`, active
+strategies, retries, and whether Guardrails generated the answer.
+
 ### `POST /chat/compare`
 
-Runs a query through multiple strategy configurations for A/B comparison.
+Runs two to five validated strategy configurations sequentially. All strategy
+flags, including `knowledge_graph`, are preserved.
 
-```json
-{
-  "query": "What is quantum entanglement?",
-  "configs": [
-    {"name": "Baseline", "multi_query": false, "hyde": false},
-    {"name": "Multi-Query", "multi_query": true, "hyde": false}
-  ]
-}
+### Operational endpoints
+
+- `GET /health` — Qdrant, Redis, and Langfuse status and latency.
+- `GET /api/metrics` — in-process dashboard aggregates.
+- `GET /api/traces?limit=100` — bounded trace history.
+- `GET /api/pipeline-health` — updater and reconciler health/DLQ state.
+- `GET /api/eval-results` — stored benchmark reports.
+
+If `API_KEY` is set, send it as `X-API-Key` on chat routes. Set
+`RATE_LIMIT_PER_MINUTE=0` only for controlled local testing.
+
+## Testing
+
+```powershell
+python -m pytest
+python -m ruff check .
+python -m ruff format --check .
+python -m compileall -q backend data_pipeline evaluation frontend tests
+Get-ChildItem dashboard -Recurse -Filter *.js | ForEach-Object { node --check $_.FullName }
+python -m data_pipeline.verify_pipeline
 ```
 
-### `GET /health`
+The unit suite covers local deletion forwarding, latest-state payload metadata,
+citation rejection, hallucination abstention routing, cache partitioning, and
+request validation. The verification suite supports local embedded Qdrant and
+remote Qdrant; Redis is required for the cache integration cases.
 
-Returns the status and latency of infrastructure components (Qdrant, Redis, Langfuse).
+When validating an existing embedded dataset, run the verifier with
+`QDRANT_MODE=local`; when validating Docker services, use `QDRANT_MODE=remote`
+and the service URL. The ingestion checkpoint is resumability metadata, not a
+guarantee of the number of points currently present in Qdrant.
 
-### `GET /api/metrics`
+## Evaluation
 
-Returns aggregated dashboard metrics from the in-memory trace log (KPIs, attribution breakdown, guardrails stats, grade counts).
+```powershell
+python -m evaluation.harness --dataset nq --subset 10
+python -m evaluation.harness --dataset triviaqa --subset 10
+```
 
-### `GET /api/traces?limit=100`
+Benchmark results depend on the indexed corpus, model, provider, and strategies.
+Files in `evaluation/results/` are historical artifacts, not guarantees for
+every deployment.
 
-Returns the last N query traces with full detail for the dashboard trace explorer.
+## Design boundaries
 
-### `GET /api/eval-results`
-
-Returns evaluation benchmark results from `evaluation/results/`.
-
-### `GET /api/pipeline-health`
-
-Returns health status of data pipeline workers (wiki-updater and reconciler) including DLQ sizes, heartbeats, drift metrics, and failure counts.
-
-## Tech Stack
-
-| Category | Technologies |
-|----------|-------------|
-| **LLM Orchestration** | LangGraph, LangChain, OpenAI |
-| **Vector Database** | Qdrant (Dense + Sparse + RRF) |
-| **Embeddings** | FastEmbed (BAAI/bge-small-en-v1.5) |
-| **Knowledge Graph** | spaCy, NetworkX, Redis |
-| **Reranking** | FlashRank (cross-encoder) |
-| **Caching** | Redis (semantic cache + KG persistence) |
-| **Guardrails** | NeMo Guardrails |
-| **Observability** | Langfuse (self-hosted), Custom Dashboard (Chart.js) |
-| **Web Framework** | FastAPI, Streamlit |
-| **Data Pipeline** | HuggingFace Datasets, aiohttp, MediaWiki API |
-| **Evaluation** | Custom harness with NQ/TriviaQA datasets |
+- Historical article versions are not retained.
+- Latest-state replacement is not a distributed transaction across Qdrant and
+  derived indexes; failures go to the DLQ and are retried.
+- Dashboard traces are process-local and reset on restart; Langfuse/Prometheus
+  are the durable observability paths.
+- Pure-Redis semantic matching is bounded and O(n); RedisVL is preferred at
+  larger cache sizes.
+- Embedded Qdrant is convenient for development but is not the recommended
+  deployment mode once the collection grows beyond a small test corpus.
+- Production deployments should set `API_KEY` and use an ingress or gateway.
 
 ## License
 
