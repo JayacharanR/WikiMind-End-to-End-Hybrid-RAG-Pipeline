@@ -9,7 +9,7 @@ import json
 import logging
 import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 import requests
 import streamlit as st
@@ -88,7 +88,11 @@ def _run_single_query(query: str, strategies: Dict[str, bool]) -> Dict[str, Any]
                 result = json.loads(event.data)
                 break
             elif event.event == "error":
-                result = {"answer": f"Error: {json.loads(event.data).get('detail', 'Unknown')}", "sources": [], "metadata": {}}
+                result = {
+                    "answer": f"Error: {json.loads(event.data).get('detail', 'Unknown')}",
+                    "sources": [],
+                    "metadata": {},
+                }
                 break
 
         latency = time.monotonic() - start
@@ -151,7 +155,7 @@ def render_ab_dashboard():
         st.subheader("Results Comparison")
 
         cols = st.columns(len(selected_configs))
-        for col, config_name in zip(cols, selected_configs):
+        for col, config_name in zip(cols, selected_configs, strict=False):
             result = results[config_name]
             metadata = result.get("metadata", {})
             sources = result.get("sources", [])
@@ -175,7 +179,7 @@ def render_ab_dashboard():
                     with st.expander(f"Retrieved Sources ({len(sources)})"):
                         for j, src in enumerate(sources):
                             st.markdown(
-                                f"**[{j+1}] {src.get('title', 'Unknown')}** "
+                                f"**[{j + 1}] {src.get('title', 'Unknown')}** "
                                 f"(score: {src.get('score', 0):.3f})"
                             )
                             content = src.get("content", "")[:200]
@@ -235,13 +239,17 @@ def render_ab_dashboard():
         for config_name in selected_configs:
             results_list = batch_results[config_name]
             avg_latency = sum(r.get("latency", 0) for r in results_list) / len(results_list)
-            avg_steps = sum(r.get("metadata", {}).get("agent_steps", 0) for r in results_list) / len(results_list)
+            avg_steps = sum(
+                r.get("metadata", {}).get("agent_steps", 0) for r in results_list
+            ) / len(results_list)
             avg_sources = sum(len(r.get("sources", [])) for r in results_list) / len(results_list)
-            agg_data.append({
-                "Configuration": config_name,
-                "Avg Latency (s)": round(avg_latency, 3),
-                "Avg Steps": round(avg_steps, 1),
-                "Avg Sources": round(avg_sources, 1),
-            })
+            agg_data.append(
+                {
+                    "Configuration": config_name,
+                    "Avg Latency (s)": round(avg_latency, 3),
+                    "Avg Steps": round(avg_steps, 1),
+                    "Avg Sources": round(avg_sources, 1),
+                }
+            )
 
         st.table(agg_data)

@@ -1,8 +1,8 @@
-import urllib.request
-import json
-import zipfile
-import os
 import io
+import json
+import os
+import urllib.request
+import zipfile
 
 print("Fetching latest llama.cpp release...")
 req = urllib.request.Request("https://api.github.com/repos/ggerganov/llama.cpp/releases/latest")
@@ -23,18 +23,20 @@ if not llama_url:
     print("Could not find CUDA Windows build.")
     exit(1)
 
+
 def download_and_extract(url, out_dir):
     print(f"Downloading from {url}...")
-    req = urllib.request.Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req) as response:
         zip_data = response.read()
     print("Extracting...")
     os.makedirs(out_dir, exist_ok=True)
     with zipfile.ZipFile(io.BytesIO(zip_data)) as z:
         for file_info in z.infolist():
-            if file_info.filename.endswith('.exe') or file_info.filename.endswith('.dll'):
+            if file_info.filename.endswith(".exe") or file_info.filename.endswith(".dll"):
                 file_info.filename = os.path.basename(file_info.filename)
                 z.extract(file_info, out_dir)
+
 
 download_and_extract(llama_url, "local_llm")
 if cudart_url:

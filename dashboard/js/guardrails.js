@@ -4,6 +4,12 @@
 
 import { createDoughnutChart, createHorizontalBarChart } from './charts.js';
 
+function escapeHtml(str) {
+  if (typeof str !== 'string') return str ?? '';
+  return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;').replace(/'/g, '&#039;');
+}
+
 /**
  * Render the Guardrails tab content.
  * @param {Object} summary - metrics summary from /api/metrics
@@ -83,7 +89,7 @@ function renderGuardrailsLog(traces) {
         ${events.slice(0, 30).map(t => `
           <tr>
             <td style="font-size:0.75rem;white-space:nowrap">${new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', hour12: false })}</td>
-            <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.query?.slice(0, 60) || '—'}</td>
+            <td style="max-width:300px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(t.query?.slice(0, 60)) || '—'}</td>
             <td class="center">${t.guardrails_applied
               ? '<span class="badge badge-success">Applied</span>'
               : '<span class="badge badge-neutral">Bypassed</span>'}</td>

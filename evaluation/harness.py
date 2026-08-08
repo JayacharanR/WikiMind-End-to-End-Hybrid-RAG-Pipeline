@@ -13,9 +13,8 @@ import argparse
 import asyncio
 import json
 import logging
-import os
 import time
-from typing import Any, Dict, List
+from typing import Any, Dict
 
 from evaluation.datasets import load_nq_subset, load_triviaqa_subset
 from evaluation.metrics import answer_accuracy, mean_reciprocal_rank, recall_at_k
@@ -60,7 +59,7 @@ async def _evaluate_single_query(
     Returns:
         Dict containing per-query metrics and raw outputs.
     """
-    from backend.agent import agent_app, AgentState
+    from backend.agent import AgentState, agent_app
     from backend.models import QueryStrategies
 
     active_strategies = QueryStrategies(**strategies)
@@ -80,6 +79,8 @@ async def _evaluate_single_query(
         "hallucination_retries": 0,
         "answer_retries": 0,
         "article_discovery_failed": False,
+        "article_discovery_status": "unknown",
+        "retrieval_status": "unknown",
         "citation_map": {},
         "provenance_score": 0.0,
         "attribution": "unknown",
@@ -98,10 +99,7 @@ async def _evaluate_single_query(
         step_count = final_state.get("steps", 0)
 
         # Extract retrieved text for metric computation
-        retrieved_texts = [
-            doc.get("content", doc.get("page_content", ""))
-            for doc in documents
-        ]
+        retrieved_texts = [doc.get("content", doc.get("page_content", "")) for doc in documents]
 
         # Compute metrics
         rec_5 = recall_at_k(retrieved_texts, gold_answer, k=5)
@@ -193,7 +191,10 @@ async def run_evaluation(
             avg_latency = sum(r["latency"] for r in completed) / len(completed)
             logger.info(
                 "  Progress: %d/%d | Last 10 avg recall@5=%.2f, avg latency=%.2fs",
-                i + 1, len(samples), avg_recall, avg_latency,
+                i + 1,
+                len(samples),
+                avg_recall,
+                avg_latency,
             )
 
     # Generate report
@@ -267,11 +268,13 @@ def main():
 
     config = _load_config(args.config)
 
-    asyncio.run(run_evaluation(
-        dataset_name=args.dataset,
-        subset_size=args.subset,
-        config=config,
-    ))
+    asyncio.run(
+        run_evaluation(
+            dataset_name=args.dataset,
+            subset_size=args.subset,
+            config=config,
+        )
+    )
 
 
 if __name__ == "__main__":

@@ -5,11 +5,10 @@ HuggingFace. Supports Natural Questions (NQ) and TriviaQA with configurable
 subset sizes and local caching.
 """
 
-import hashlib
 import json
 import logging
 import os
-from typing import Dict, List, Tuple
+from typing import Dict, List
 
 logger = logging.getLogger(__name__)
 
@@ -104,7 +103,9 @@ def load_nq_subset(n: int = 500) -> List[Dict]:
         # Find the first annotator with a non-empty answer span
         start_token = -1
         end_token = -1
-        for ann_starts, ann_ends in zip(start_tokens_per_annotator, end_tokens_per_annotator):
+        for ann_starts, ann_ends in zip(
+            start_tokens_per_annotator, end_tokens_per_annotator, strict=False
+        ):
             if isinstance(ann_starts, list):
                 # Each annotator provides a list of spans; take the first
                 if ann_starts and ann_ends:
@@ -142,11 +143,13 @@ def load_nq_subset(n: int = 500) -> List[Dict]:
         title = example.get("document", {}).get("title", "")
 
         if question:
-            samples.append({
-                "question": question,
-                "gold_answer": answer_text,
-                "wikipedia_title": title,
-            })
+            samples.append(
+                {
+                    "question": question,
+                    "gold_answer": answer_text,
+                    "wikipedia_title": title,
+                }
+            )
 
     logger.info("Extracted %d NQ samples with valid short answers.", len(samples))
     _save_to_cache(cache_path, samples)
@@ -200,11 +203,13 @@ def load_triviaqa_subset(n: int = 500) -> List[Dict]:
         search_contexts = search_results.get("search_context", [])
         evidence = search_contexts[0] if search_contexts else ""
 
-        samples.append({
-            "question": question,
-            "gold_answer": answer_text,
-            "evidence": evidence[:1000] if evidence else "",
-        })
+        samples.append(
+            {
+                "question": question,
+                "gold_answer": answer_text,
+                "evidence": evidence[:1000] if evidence else "",
+            }
+        )
 
     logger.info("Extracted %d TriviaQA samples.", len(samples))
     _save_to_cache(cache_path, samples)

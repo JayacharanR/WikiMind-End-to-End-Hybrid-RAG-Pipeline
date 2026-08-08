@@ -8,12 +8,12 @@ dependencies beyond the standard library.
 
 import re
 import statistics
-from typing import Dict, List, Optional
-
+from typing import Dict, List
 
 # ---------------------------------------------------------------------------
 # Text Normalization
 # ---------------------------------------------------------------------------
+
 
 def _normalize_text(text: str) -> str:
     """Normalize text for comparison by lowercasing, stripping articles,
@@ -41,6 +41,7 @@ def _normalize_text(text: str) -> str:
 # ---------------------------------------------------------------------------
 # Retrieval Metrics
 # ---------------------------------------------------------------------------
+
 
 def recall_at_k(retrieved_texts: List[str], gold_answer: str, k: int = 5) -> float:
     """Compute Recall@K for a single query.
@@ -94,6 +95,7 @@ def mean_reciprocal_rank(retrieved_texts: List[str], gold_answer: str) -> float:
 # Answer Accuracy
 # ---------------------------------------------------------------------------
 
+
 def answer_accuracy(generation: str, gold_answer: str) -> float:
     """Compute answer accuracy via normalized substring match.
 
@@ -120,6 +122,7 @@ def answer_accuracy(generation: str, gold_answer: str) -> float:
 # ---------------------------------------------------------------------------
 # Latency Metrics
 # ---------------------------------------------------------------------------
+
 
 def compute_latency_percentiles(latencies: List[float]) -> Dict[str, float]:
     """Compute P50, P95, and P99 latency percentiles.
@@ -155,6 +158,7 @@ def compute_latency_percentiles(latencies: List[float]) -> Dict[str, float]:
 # ---------------------------------------------------------------------------
 # Aggregate Metrics
 # ---------------------------------------------------------------------------
+
 
 def compute_aggregate_metrics(
     per_query_results: List[Dict],

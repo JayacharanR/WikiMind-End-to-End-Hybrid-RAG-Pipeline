@@ -30,16 +30,18 @@ def _list_evaluation_runs() -> List[Dict]:
             try:
                 with open(json_path, "r") as f:
                     data = json.load(f)
-                runs.append({
-                    "filename": filename,
-                    "json_path": json_path,
-                    "md_path": md_path if os.path.exists(md_path) else None,
-                    "dataset": data.get("dataset", "unknown"),
-                    "timestamp": data.get("timestamp", "unknown"),
-                    "total_queries": data.get("aggregates", {}).get("total_queries", 0),
-                    "aggregates": data.get("aggregates", {}),
-                    "config": data.get("config", {}),
-                })
+                runs.append(
+                    {
+                        "filename": filename,
+                        "json_path": json_path,
+                        "md_path": md_path if os.path.exists(md_path) else None,
+                        "dataset": data.get("dataset", "unknown"),
+                        "timestamp": data.get("timestamp", "unknown"),
+                        "total_queries": data.get("aggregates", {}).get("total_queries", 0),
+                        "aggregates": data.get("aggregates", {}),
+                        "config": data.get("config", {}),
+                    }
+                )
             except Exception as exc:
                 logger.warning("Failed to load results file %s: %s", filename, exc)
 
@@ -65,8 +67,7 @@ def render_eval_results():
 
     # Run selector
     run_labels = [
-        f"{r['timestamp']} -- {r['dataset']} ({r['total_queries']} queries)"
-        for r in runs
+        f"{r['timestamp']} -- {r['dataset']} ({r['total_queries']} queries)" for r in runs
     ]
     selected_idx = st.selectbox(
         "Select an evaluation run:",
@@ -130,15 +131,17 @@ def render_eval_results():
             # Display as a table
             table_data = []
             for r in sorted_results[:50]:
-                table_data.append({
-                    "Question": r.get("question", "")[:80],
-                    "Gold Answer": r.get("gold_answer", "")[:40],
-                    "Accuracy": r.get("answer_accuracy", 0.0),
-                    "Recall@5": r.get("recall_at_5", 0.0),
-                    "MRR": r.get("mrr", 0.0),
-                    "Latency (s)": r.get("latency", 0.0),
-                    "Steps": r.get("step_count", 0),
-                })
+                table_data.append(
+                    {
+                        "Question": r.get("question", "")[:80],
+                        "Gold Answer": r.get("gold_answer", "")[:40],
+                        "Accuracy": r.get("answer_accuracy", 0.0),
+                        "Recall@5": r.get("recall_at_5", 0.0),
+                        "MRR": r.get("mrr", 0.0),
+                        "Latency (s)": r.get("latency", 0.0),
+                        "Steps": r.get("step_count", 0),
+                    }
+                )
 
             st.dataframe(table_data, use_container_width=True)
 

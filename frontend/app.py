@@ -10,10 +10,10 @@ FastAPI backend, and renders retrieved sources and execution metadata.
 import json
 import logging
 import os
-import requests
 import time
-from typing import Dict, Any
+from typing import Any, Dict
 
+import requests
 import sseclient
 import streamlit as st
 
@@ -127,54 +127,52 @@ def inject_llama_css():
         }
         </style>
         """,
-        unsafe_allow_html=True
+        unsafe_allow_html=True,
     )
 
 
 def configure_sidebar() -> Dict[str, Any]:
     """Render the configuration sidebar and return the selected strategies."""
     st.sidebar.title("WikiMind Configuration")
-    
+
     st.sidebar.subheader("Retrieval Architecture")
     st.sidebar.markdown(
         "WikiMind uses **Two-Stage Hybrid RAG**: a local article-level index "
         "identifies the relevant Wikipedia articles, then Qdrant hybrid search "
         "(Dense + Sparse + RRF + Reranker) extracts precise chunks from those articles."
     )
-    
+
     st.sidebar.divider()
-    
+
     st.sidebar.subheader("Query Expansion")
     st.sidebar.markdown("Toggle parallel expansion strategies.")
-    
+
     multi_query = st.sidebar.toggle(
-        "Multi-Query Reformulation", 
+        "Multi-Query Reformulation",
         value=False,
-        help="Generate semantic alternatives to the original query."
+        help="Generate semantic alternatives to the original query.",
     )
-    
+
     hyde = st.sidebar.toggle(
-        "HyDE (Hypothetical Document Embeddings)", 
+        "HyDE (Hypothetical Document Embeddings)",
         value=False,
-        help="Generate a hypothetical answer to embed for semantic search."
+        help="Generate a hypothetical answer to embed for semantic search.",
     )
-    
+
     step_back = st.sidebar.toggle(
-        "Step-Back Abstraction", 
+        "Step-Back Abstraction",
         value=False,
-        help="Abstract the query to a higher-level foundational question."
+        help="Abstract the query to a higher-level foundational question.",
     )
-    
+
     decomposition = st.sidebar.toggle(
-        "Query Decomposition", 
-        value=False,
-        help="Break complex queries into atomic sub-questions."
+        "Query Decomposition", value=False, help="Break complex queries into atomic sub-questions."
     )
-    
+
     st.sidebar.divider()
-    
+
     st.sidebar.divider()
-    
+
     st.sidebar.subheader("System Health")
     if st.sidebar.button("Check Backend Health"):
         try:
@@ -191,7 +189,7 @@ def configure_sidebar() -> Dict[str, Any]:
                 st.sidebar.error("Backend returned an error.")
         except Exception as exc:
             st.sidebar.error(f"Cannot reach backend: {exc}")
-            
+
     return {
         "multi_query": multi_query,
         "hyde": hyde,
@@ -202,7 +200,7 @@ def configure_sidebar() -> Dict[str, Any]:
 
 def stream_chat_response(query: str, strategies: Dict[str, bool]):
     """Stream the response from the FastAPI SSE endpoint.
-    
+
     Handles two response modes:
     - JSON (cache hit): Backend returns application/json immediately
     - SSE (cache miss): Backend streams node-by-node progress events
@@ -211,15 +209,12 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
         "query": query,
         "strategies": strategies,
     }
-    
+
     try:
         start_time = time.time()
         # Use requests to get the SSE stream
         response = requests.post(
-            f"{API_URL}/chat", 
-            json=payload,
-            stream=True,
-            headers={'Accept': 'text/event-stream'}
+            f"{API_URL}/chat", json=payload, stream=True, headers={"Accept": "text/event-stream"}
         )
         response.raise_for_status()
 
@@ -236,38 +231,42 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
             if sources:
                 with st.expander(f"View {len(sources)} Retrieved Sources"):
                     for i, source in enumerate(sources):
-                        st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
+                        st.markdown(
+                            f"**[{i + 1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})"
+                        )
                         st.markdown(f"> {source.get('content', '')[:300]}...")
                         st.divider()
             with st.expander("Execution Metadata"):
                 st.json(metadata)
-            st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources, "metadata": metadata})
+            st.session_state.messages.append(
+                {"role": "assistant", "content": answer, "sources": sources, "metadata": metadata}
+            )
             return
 
         # Cache miss: parse SSE stream
         client = sseclient.SSEClient(response)
-        
+
         status_placeholder = st.empty()
         answer_placeholder = st.empty()
         sources_placeholder = st.empty()
-        
+
         for event in client.events():
             if event.event == "update":
                 data = json.loads(event.data)
                 node = data.get("node")
                 status = data.get("status")
                 status_placeholder.info(f"Agent working: {status} ({node})")
-                
+
             elif event.event == "final":
                 total_time = time.time() - start_time
                 data = json.loads(event.data)
-                
+
                 # Clear status
                 status_placeholder.empty()
-                
+
                 # Render answer
                 answer = data.get("answer", "")
-                
+
                 # If answer is a JSON tool call, parse it out
                 try:
                     ans_json = json.loads(answer)
@@ -278,24 +277,26 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                         answer = params.get("input", answer)
                 except Exception:
                     pass
-                
+
                 answer_placeholder.markdown(answer)
-                
+
                 # Render metadata and add total time taken
                 metadata = data.get("metadata", {})
                 metadata["total_time_seconds"] = round(total_time, 2)
-                
+
                 # Render sources
                 sources = data.get("sources", [])
                 if sources:
                     with sources_placeholder.expander(f"View {len(sources)} Retrieved Sources"):
                         for i, source in enumerate(sources):
-                            st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
+                            st.markdown(
+                                f"**[{i + 1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})"
+                            )
                             st.markdown(f"> {source.get('content')[:300]}...")
-                            if source.get('url'):
+                            if source.get("url"):
                                 st.markdown(f"[Read on Wikipedia]({source.get('url')})")
                             st.divider()
-                            
+
                 # Render expanded queries if any
                 expanded_queries = metadata.get("expanded_queries", [])
                 strategies_used = metadata.get("strategies_used", [])
@@ -308,37 +309,47 @@ def stream_chat_response(query: str, strategies: Dict[str, bool]):
                         with st.expander("View Expanded Queries"):
                             for q in expanded_queries[1:]:
                                 st.markdown(f"- {q}")
-                            
+
                 with st.expander("Execution Metadata"):
                     st.json(metadata)
-                    
+
                 # Save to session state
-                st.session_state.messages.append({"role": "assistant", "content": answer, "sources": sources, "metadata": metadata})
+                st.session_state.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": answer,
+                        "sources": sources,
+                        "metadata": metadata,
+                    }
+                )
                 break
-                
+
             elif event.event == "error":
                 data = json.loads(event.data)
                 st.error(f"Backend error: {data.get('detail')}")
                 break
-                
+
     except Exception as exc:
         st.error(f"Failed to connect to backend: {exc}")
 
 
 def chat_page():
     """Render the main chat interface page."""
-    
+
     # Sidebar config
     strategies = configure_sidebar()
-    
+
     # Initialize chat history
     if "messages" not in st.session_state:
         st.session_state.messages = []
-        
+
     if len(st.session_state.messages) == 0:
         st.markdown('<div class="empty-state-title">Hello there</div>', unsafe_allow_html=True)
-        st.markdown('<div class="empty-state-subtitle">Type a message to get started with WikiMind</div>', unsafe_allow_html=True)
-        
+        st.markdown(
+            '<div class="empty-state-subtitle">Type a message to get started with WikiMind</div>',
+            unsafe_allow_html=True,
+        )
+
     # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
@@ -346,10 +357,12 @@ def chat_page():
             if message["role"] == "assistant":
                 if message.get("sources"):
                     with st.expander(f"View {len(message['sources'])} Retrieved Sources"):
-                        for i, source in enumerate(message['sources']):
-                            st.markdown(f"**[{i+1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})")
+                        for i, source in enumerate(message["sources"]):
+                            st.markdown(
+                                f"**[{i + 1}] {source.get('title')}** (Score: {source.get('score', 0):.2f})"
+                            )
                             st.markdown(f"> {source.get('content')[:300]}...")
-                            if source.get('url'):
+                            if source.get("url"):
                                 st.markdown(f"[Read on Wikipedia]({source.get('url')})")
                             st.divider()
                 if message.get("metadata"):
@@ -366,16 +379,16 @@ def chat_page():
                                     st.markdown(f"- {q}")
                     with st.expander("Execution Metadata"):
                         st.json(message["metadata"])
-                        
+
     # Chat input
     if query := st.chat_input("Ask Wikipedia something complex..."):
         # Display user message
         with st.chat_message("user"):
             st.markdown(query)
-            
+
         # Add to session state
         st.session_state.messages.append({"role": "user", "content": query})
-        
+
         # Display assistant response stream
         with st.chat_message("assistant"):
             stream_chat_response(query, strategies)
@@ -387,7 +400,7 @@ def main():
         page_title="WikiMind | Hybrid RAG Pipeline",
         layout="wide",
     )
-    
+
     inject_llama_css()
 
     from frontend.pages.ab_dashboard import render_ab_dashboard
@@ -405,4 +418,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-

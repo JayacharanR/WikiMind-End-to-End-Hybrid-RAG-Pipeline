@@ -52,7 +52,7 @@ def generate_report(
 
     # Build the markdown report
     lines = []
-    lines.append(f"# WikiMind Evaluation Report")
+    lines.append("# WikiMind Evaluation Report")
     lines.append("")
     lines.append(f"**Dataset:** {dataset_name}")
     lines.append(f"**Timestamp:** {timestamp}")
@@ -100,7 +100,9 @@ def generate_report(
         rec = result.get("recall_at_5", 0.0)
         mrr = result.get("mrr", 0.0)
         lat = result.get("latency", 0.0)
-        lines.append(f"| {i+1} | {question} | {gold} | {acc:.2f} | {rec:.2f} | {mrr:.2f} | {lat:.2f}s |")
+        lines.append(
+            f"| {i + 1} | {question} | {gold} | {acc:.2f} | {rec:.2f} | {mrr:.2f} | {lat:.2f}s |"
+        )
 
     lines.append("")
 
