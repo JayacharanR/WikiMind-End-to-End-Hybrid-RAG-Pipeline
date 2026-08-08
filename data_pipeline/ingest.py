@@ -289,6 +289,9 @@ def process_batch(
         text = article.get("text", "")
         url = article.get("url", "")
         revision_id = str(article.get("id", ""))
+        # HF dataset 'id' is a document identifier, NOT a MediaWiki revision.
+        # Mark it as such so the reconciler doesn't false-alarm.
+        revision_source = "dataset_snapshot"
         ingested_at = datetime.now(timezone.utc).isoformat()
         
         chunks = splitter.split_text(text)
@@ -303,7 +306,8 @@ def process_batch(
                 "url": url,
                 "chunk_index": i,
                 "entities": entities,
-                "revision_id": revision_id,
+                "source_document_id": revision_id,
+                "revision_source": revision_source,
                 "ingested_at": ingested_at,
             })
 

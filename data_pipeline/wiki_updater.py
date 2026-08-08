@@ -112,7 +112,27 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     dense_embeddings = list(dense_model.embed(chunks))
     sparse_embeddings = list(sparse_model.embed(chunks))
 
-    # 4. Build points with deterministic IDs (overwrite existing chunks)
+    # 4. Delete ALL existing chunks for this article before upserting new ones.
+    #    This prevents stale chunks from remaining when the article shrinks.
+    try:
+        await qdrant.delete(
+            collection_name=settings.qdrant_collection,
+            points_selector=models.FilterSelector(
+                filter=models.Filter(
+                    must=[
+                        models.FieldCondition(
+                            key="title",
+                            match=models.MatchValue(value=title),
+                        ),
+                    ]
+                )
+            ),
+        )
+        logger.debug("Deleted existing chunks for '%s' before re-ingestion.", title)
+    except Exception as exc:
+        logger.warning("Failed to delete old chunks for '%s': %s (proceeding with upsert)", title, exc)
+
+    # 5. Build points with deterministic IDs
     from datetime import datetime, timezone
     ingested_at = datetime.now(timezone.utc).isoformat()
 
@@ -137,6 +157,7 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
                     "page_content": chunk_text,
                     "chunk_index": i,
                     "revision_id": revision_id,
+                    "revision_source": "live",
                     "ingested_at": ingested_at,
                 }
             )
@@ -146,7 +167,16 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
         collection_name=settings.qdrant_collection,
         points=qdrant_points
     )
-    logger.debug("Successfully updated %s (%d chunks, revision %s)", title, len(chunks), revision_id)
+    logger.debug("Upserted %d chunks for '%s' (revision %s)", len(chunks), title, revision_id)
+
+    # 6. Update article-level index so Stage 1 discovery stays fresh (P1-4)
+    try:
+        from backend.article_index import upsert_article
+        summary_text = f"{title}. {chunks[0][:500]}" if chunks else title
+        await upsert_article(title, summary_text, uri)
+        logger.debug("Updated article index for '%s'", title)
+    except Exception as exc:
+        logger.warning("Failed to update article index for '%s': %s", title, exc)
 
 
 async def listen_to_stream():

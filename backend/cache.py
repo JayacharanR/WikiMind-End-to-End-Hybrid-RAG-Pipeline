@@ -100,16 +100,17 @@ def _hash_query(query: str, strategies: dict = None) -> str:
     return f"wikimind:cache:l1:{digest}"
 
 
-async def l1_get(query: str) -> Optional[dict]:
+async def l1_get(query: str, strategies: dict = None) -> Optional[dict]:
     """Look up an exact-match cached response for the given query.
 
     Args:
         query: The user's query string.
+        strategies: Optional strategy toggles to include in cache key.
 
     Returns:
         Cached response dict if found, None otherwise.
     """
-    key = _hash_query(query)
+    key = _hash_query(query, strategies)
 
     try:
         client = await get_redis_client()
@@ -123,18 +124,19 @@ async def l1_get(query: str) -> Optional[dict]:
     return None
 
 
-async def l1_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
+async def l1_set(query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None) -> None:
     """Store a response in the L1 exact-match cache.
 
     Args:
         query: The user's query string (will be normalized and hashed).
         response: The response dict to cache.
         ttl: Time-to-live in seconds. Defaults to the static TTL from settings.
+        strategies: Optional strategy toggles to include in cache key.
     """
     try:
         settings = get_settings()
         client = await get_redis_client()
-        key = _hash_query(query)
+        key = _hash_query(query, strategies)
         effective_ttl = ttl or settings.cache_ttl_static
         await client.setex(key, effective_ttl, json.dumps(response))
         logger.debug("L1 cache SET for query hash %s (TTL=%ds)", key[-12:], effective_ttl)
@@ -388,7 +390,7 @@ async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
 # Unified Cache Interface
 # ---------------------------------------------------------------------------
 
-async def cache_lookup(query: str) -> tuple[Optional[dict], Optional[str]]:
+async def cache_lookup(query: str, strategies: dict = None) -> tuple[Optional[dict], Optional[str]]:
     """Perform a tiered cache lookup (L1 first, then L2).
 
     The caller should check the returned cache level to log appropriate
@@ -396,6 +398,7 @@ async def cache_lookup(query: str) -> tuple[Optional[dict], Optional[str]]:
 
     Args:
         query: The user's query string.
+        strategies: Optional strategy toggles for cache key partitioning.
 
     Returns:
         A tuple of (cached_response, cache_level) where cache_level is
@@ -404,13 +407,13 @@ async def cache_lookup(query: str) -> tuple[Optional[dict], Optional[str]]:
     start = time.monotonic()
 
     # L1: exact match (fastest)
-    result = await l1_get(query)
+    result = await l1_get(query, strategies)
     if result is not None:
         elapsed = (time.monotonic() - start) * 1000
         logger.info("Cache resolved via L1 in %.1fms", elapsed)
         return result, "l1"
 
-    # L2: semantic similarity
+    # L2: semantic similarity (strategy-blind — uses raw query only)
     result = await l2_get(query)
     if result is not None:
         elapsed = (time.monotonic() - start) * 1000
@@ -422,7 +425,7 @@ async def cache_lookup(query: str) -> tuple[Optional[dict], Optional[str]]:
     return None, None
 
 
-async def cache_store(query: str, response: dict, ttl: Optional[int] = None) -> None:
+async def cache_store(query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None) -> None:
     """Store a response in both L1 and L2 caches.
 
     Writing to both layers ensures that identical queries are served from
@@ -433,12 +436,13 @@ async def cache_store(query: str, response: dict, ttl: Optional[int] = None) -> 
         query: The user's query string.
         response: The response dict to cache.
         ttl: Time-to-live in seconds. Defaults to the static TTL from settings.
+        strategies: Optional strategy toggles for cache key partitioning.
     """
-    await l1_set(query, response, ttl=ttl)
+    await l1_set(query, response, ttl=ttl, strategies=strategies)
     await l2_set(query, response, ttl=ttl)
 
 
-async def cache_invalidate(query: str) -> None:
+async def cache_invalidate(query: str, strategies: dict = None) -> None:
     """Invalidate cached entries for a specific query.
 
     Removes the L1 exact-match entry. L2 entries will expire via TTL
@@ -446,9 +450,10 @@ async def cache_invalidate(query: str) -> None:
 
     Args:
         query: The query string whose cache entries should be invalidated.
+        strategies: Optional strategy toggles for cache key partitioning.
     """
     client = await get_redis_client()
-    key = _hash_query(query)
+    key = _hash_query(query, strategies)
     try:
         await client.delete(key)
         logger.debug("L1 cache invalidated for query hash %s", key[-12:])

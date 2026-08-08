@@ -14,7 +14,7 @@ encountering the project for the first time.
 4. [How a Query Flows Through the System](#how-a-query-flows-through-the-system)
 5. [Detailed Component Breakdown](#detailed-component-breakdown)
 6. [Knowledge Graph Layer](#knowledge-graph-layer)
-7. [Temporal Versioning and Time-Travel](#temporal-versioning-and-time-travel)
+7. [Latest-State Design](#latest-state-design)
 8. [Evaluation Harness](#evaluation-harness)
 9. [Observability (Langfuse)](#observability-langfuse)
 10. [Custom Observability Dashboard](#custom-observability-dashboard)
@@ -458,26 +458,34 @@ of the telephone attend?":
 
 ---
 
-## Temporal Versioning and Time-Travel
+## Latest-State Design
 
-Every chunk in Qdrant stores three versioning fields:
+WikiMind operates on a **latest-state-only** data model. Each article in the
+vector store represents the most recent version of that Wikipedia article.
 
-- `revision_id`: The Wikipedia revision ID at the time of ingestion.
+Every chunk stores metadata for freshness tracking:
+
+- `revision_id`: The MediaWiki revision ID (for live-synced data).
+- `revision_source`: Either `"live"` (from EventStreams) or `"dataset_snapshot"`
+  (from batch ingestion). The reconciler uses this to distinguish real revision
+  comparisons from dataset document IDs.
 - `ingested_at`: The UTC timestamp when the chunk was embedded and stored.
-- `is_current`: Boolean flag indicating whether this is the latest version.
 
-### Default Behavior
+### How Updates Work
 
-Normal queries automatically filter to `is_current=true`, so you always get
-the latest version of every article.
+When a Wikipedia article is edited, the live sync worker:
 
-### Time-Travel Mode
+1. **Deletes all existing chunks** for that article (by title filter).
+2. **Re-chunks** the updated article text.
+3. **Upserts the new chunks** with fresh embeddings and the new revision ID.
+4. **Updates the article-level index** so Stage 1 discovery stays current.
 
-When the user enables Time-Travel in the sidebar and selects a date, the query
-filter switches from `is_current=true` to `ingested_at <= selected_date`. This
-retrieves the version of the article as it existed on that date.
+This atomic delete-then-upsert ensures that shortened or restructured articles
+do not leave orphaned chunks in the collection.
 
-Use case: "What did the Wikipedia article about COVID-19 say in March 2020?"
+> **Note:** Historical versioning (time-travel queries) was considered but
+> intentionally omitted to keep storage simple and the product promise clear:
+> WikiMind answers from the latest synchronized Wikipedia state.
 
 ---
 

@@ -107,18 +107,24 @@ async def node_identify_articles(state: AgentState) -> Dict:
         logger.info(
             "Local article index identified %d article(s): %s",
             len(target_articles),
-            ", ".join(target_articles),
+            ", ".join(target_articles) if target_articles else "(none — will use global search)",
         )
 
         return {
             "target_articles": target_articles,
+            "article_discovery_failed": False,
             "web_snippets": [],
             "steps": steps,
         }
 
     except Exception as exc:
         logger.error("Article index search failed: %s", exc)
-        return {"target_articles": [], "web_snippets": [], "steps": steps}
+        return {
+            "target_articles": [],
+            "article_discovery_failed": True,
+            "web_snippets": [],
+            "steps": steps,
+        }
 
 
 async def node_graph_search(state: AgentState) -> Dict:
@@ -174,9 +180,21 @@ async def node_retrieve(state: AgentState) -> Dict:
     """
     queries_to_search = state.get("expanded_queries", [state["query"]])
     target_articles = state.get("target_articles", [])
+    discovery_failed = state.get("article_discovery_failed", False)
     steps = state.get("steps", 0) + 1
 
     logger.info("--- NODE: RETRIEVE (step %d) ---", steps)
+
+    # Determine retrieval scope and log explicitly
+    if target_articles:
+        retrieval_scope = "article_scoped"
+        logger.info("Retrieval scope: article-scoped (%s)", ", ".join(target_articles))
+    elif discovery_failed:
+        retrieval_scope = "global_fallback_on_error"
+        logger.warning("Retrieval scope: GLOBAL (article discovery failed — infrastructure error)")
+    else:
+        retrieval_scope = "global_no_match"
+        logger.info("Retrieval scope: global (no matching articles found)")
 
     settings = get_settings()
     all_documents = []
@@ -577,6 +595,17 @@ def _verify_citations(generation: str, citation_map: Dict, documents: List[Dict]
     return round(verified / total, 2) if total > 0 else 1.0
 
 
+def _validate_citation_refs(generation: str, num_documents: int) -> list:
+    """Check for invalid citation references (e.g., [7] when only 5 docs).
+
+    Returns:
+        List of invalid reference numbers found in the generation.
+    """
+    refs = _re.findall(r'\[(\d+)\]', generation)
+    invalid = [int(r) for r in refs if int(r) < 1 or int(r) > num_documents]
+    return list(set(invalid))
+
+
 async def node_check_hallucination(state: AgentState) -> Dict:
     """Node: Evaluate if the generation is grounded in the retrieved documents.
 
@@ -637,11 +666,27 @@ async def node_check_hallucination(state: AgentState) -> Dict:
     provenance_score = _verify_citations(generation, citation_map, documents)
     logger.info("Citation verification: provenance_score=%.2f", provenance_score)
 
+    # Phase 3: Validate citation references — reject out-of-range [N]
+    invalid_refs = _validate_citation_refs(generation, len(documents))
+    if invalid_refs:
+        logger.warning("Invalid citation references found: %s (max valid: %d)", invalid_refs, len(documents))
+        # Penalize provenance score for invalid refs
+        provenance_score = max(0.0, provenance_score - 0.3)
+
+    # Phase 4: Provenance gate — override LLM if provenance too low
+    PROVENANCE_THRESHOLD = 0.3
+    if provenance_score < PROVENANCE_THRESHOLD and is_grounded:
+        logger.warning(
+            "Provenance gate: overriding LLM grounding (score=%.2f < threshold=%.2f).",
+            provenance_score, PROVENANCE_THRESHOLD,
+        )
+        is_grounded = False
+
     if is_grounded:
-        logger.info("Hallucination check passed (grounded). LLM said: '%s'", raw[:50] if 'raw' in dir() else 'N/A')
+        logger.info("Hallucination check passed (grounded). Provenance=%.2f", provenance_score)
         return {"hallucination_grade": "grounded", "provenance_score": provenance_score, "steps": steps}
     else:
-        logger.warning("Hallucination check failed (not grounded). LLM said: '%s'. Retry %d.", raw[:50], retries + 1)
+        logger.warning("Hallucination check failed (not grounded). Provenance=%.2f. Retry %d.", provenance_score, retries + 1)
         return {
             "hallucination_grade": "hallucinated",
             "provenance_score": provenance_score,
@@ -720,9 +765,9 @@ async def node_check_answer_quality(state: AgentState) -> Dict:
         first_word = raw.split()[0] if raw.split() else ""
         is_useful = "yes" in first_word or (first_word != "no" and "yes" in raw)
     except Exception as exc:
-        logger.warning("Answer quality check LLM call failed: %s. Defaulting to unknown.", exc)
-        # Default to unknown on exception — let routing decide
-        is_useful = True
+        logger.warning("Answer quality check LLM call failed: %s. Failing closed (not_useful).", exc)
+        # Fail closed: checker outage should not auto-pass answers
+        is_useful = False
 
     if not is_useful:
         logger.warning("Answer quality failed (not useful). Retry %d.", retries + 1)

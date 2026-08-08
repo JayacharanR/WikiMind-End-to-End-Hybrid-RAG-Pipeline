@@ -58,17 +58,32 @@ async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
             if total_points == 0:
                 return []
         
-        # Use random offset for diverse sampling
+        # Use random offset for diverse sampling across the collection.
+        # Generate a random UUID as a starting point for scroll so each
+        # reconciliation cycle checks a different region of the collection.
+        import uuid
         max_offset = max(0, total_points - limit)
-        # Qdrant scroll uses point IDs as offsets, so we do multiple small scrolls
-        # with random starting positions for better coverage
+        random_offset_id = str(uuid.UUID(int=random.randint(0, 2**128 - 1)))
+
         results, _ = await qdrant.scroll(
             collection_name=collection,
             limit=min(limit * 3, total_points),  # Over-fetch to account for dedup
+            offset=random_offset_id,
             with_payload=["title"],
             with_vectors=False
         )
-        
+
+        # If random offset returned fewer results than desired, wrap around
+        # with a second scroll from the start
+        if len(results) < limit * 2:
+            wrap_results, _ = await qdrant.scroll(
+                collection_name=collection,
+                limit=min(limit * 2, total_points),
+                with_payload=["title"],
+                with_vectors=False
+            )
+            results = list(results) + list(wrap_results)
+
         # Deduplicate titles and randomly sample from results
         all_titles = list(set(
             point.payload.get("title")
@@ -80,6 +95,8 @@ async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
         if len(all_titles) > limit:
             all_titles = random.sample(all_titles, limit)
         
+        logger.info("Reconciler sampled %d unique titles from %d total points (offset=%s...)", 
+                     len(all_titles), total_points, random_offset_id[:8])
         return all_titles
     except Exception as exc:
         logger.error("Error sampling from Qdrant: %s", exc)
@@ -137,10 +154,18 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
 
                     live_revid = str(revisions[0].get("revid", ""))
 
-                    # Fetch stored revision_id from Qdrant
-                    stored_revid = await _get_stored_revision(page_title)
+                    # Fetch stored revision info from Qdrant
+                    stored_revid, rev_source = await _get_stored_revision(page_title)
 
-                    if stored_revid and stored_revid != live_revid:
+                    # Dataset-snapshot IDs are not MediaWiki revisions —
+                    # always treat as needing refresh on first reconciliation
+                    if rev_source == "dataset_snapshot":
+                        logger.info(
+                            "Refreshing '%s': batch-ingested (source_document_id=%s, not a revid)",
+                            page_title, stored_revid,
+                        )
+                        stale_titles.append((page_title, live_revid))
+                    elif stored_revid and stored_revid != live_revid:
                         logger.info(
                             "Drift detected for '%s': stored=%s, live=%s",
                             page_title, stored_revid, live_revid,
@@ -156,11 +181,12 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
     return stale_titles
 
 
-async def _get_stored_revision(title: str) -> str:
-    """Retrieve the stored revision_id for an article from Qdrant.
+async def _get_stored_revision(title: str) -> tuple:
+    """Retrieve the stored revision info for an article from Qdrant.
 
-    Scrolls for a single chunk matching the title and returns its
-    revision_id payload field.
+    Returns:
+        Tuple of (revision_id_or_source_doc_id, revision_source).
+        revision_source is 'live', 'dataset_snapshot', or '' if unknown.
     """
     qdrant = get_async_qdrant()
     settings = get_settings()
@@ -178,15 +204,19 @@ async def _get_stored_revision(title: str) -> str:
                 ]
             ),
             limit=1,
-            with_payload=["revision_id"],
+            with_payload=["revision_id", "source_document_id", "revision_source"],
             with_vectors=False,
         )
         if results:
-            return results[0].payload.get("revision_id", "")
+            payload = results[0].payload
+            rev_source = payload.get("revision_source", "")
+            # Live-sync data uses revision_id; batch data uses source_document_id
+            stored_id = payload.get("revision_id", "") or payload.get("source_document_id", "")
+            return stored_id, rev_source
     except Exception as exc:
         logger.warning("Error reading stored revision for '%s': %s", title, exc)
 
-    return ""
+    return "", ""
 
 
 async def run_reconciliation_cycle():

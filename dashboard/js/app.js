@@ -122,13 +122,19 @@ function renderRecentTable(traces) {
     return;
   }
 
+  // Reuse escapeHtml from traces.js or define inline
+  function esc(s) {
+    if (!s) return '';
+    return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+  }
+
   tbody.innerHTML = traces.map(t => {
     const latencyColor = t.latency_ms < 3000 ? 'var(--accent-emerald)' :
                          t.latency_ms < 8000 ? 'var(--accent-amber)' : 'var(--accent-rose)';
     return `
       <tr>
         <td style="font-size:0.75rem;color:var(--text-muted);white-space:nowrap">${new Date(t.timestamp).toLocaleTimeString('en-US', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })}</td>
-        <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${t.query?.slice(0, 50) || '—'}</td>
+        <td style="max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${esc(t.query?.slice(0, 50)) || '—'}</td>
         <td class="mono right" style="color:${latencyColor}">${(t.latency_ms / 1000).toFixed(2)}s</td>
         <td class="mono right">${t.steps}</td>
         <td class="center">${t.attribution === 'rag_grounded'

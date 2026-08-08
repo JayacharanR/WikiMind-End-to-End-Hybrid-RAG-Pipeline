@@ -60,10 +60,6 @@ class ChatRequest(BaseModel):
         default_factory=QueryStrategies,
         description="Optional retrieval strategy toggles.",
     )
-    session_id: Optional[str] = Field(
-        default=None,
-        description="Optional session identifier for conversation continuity.",
-    )
 
 
 class CompareRequest(BaseModel):

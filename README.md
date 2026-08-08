@@ -1,6 +1,6 @@
-# WikiMind: Production-Grade Agentic Hybrid RAG Pipeline
+# WikiMind: End-to-End Agentic Hybrid RAG Pipeline
 
-WikiMind is a production-grade, end-to-end Agentic Hybrid RAG pipeline built on the complete English Wikipedia dataset. It features two-stage local retrieval, a self-healing knowledge base synced with live Wikipedia edits, entity-based knowledge graph traversal, temporal versioning with time-travel queries, an automated evaluation harness, and a multi-page Streamlit dashboard -- all orchestrated by a LangGraph CRAG/Self-RAG state machine.
+WikiMind is an end-to-end Agentic Hybrid RAG pipeline built on the complete English Wikipedia dataset. It features two-stage local retrieval, a self-healing knowledge base synced with live Wikipedia edits, entity-based knowledge graph traversal, citation-aware generation with diagnostic verification, an automated evaluation harness, and a multi-page Streamlit dashboard — all orchestrated by a LangGraph CRAG/Self-RAG state machine.
 
 ## Architecture
 
@@ -55,8 +55,7 @@ graph TD
 |---------|-------------|------|
 | **Two-Stage Hybrid Retrieval** | Local article-level index for discovery, then article-scoped Dense + Sparse (BM25) + RRF + Cross-Encoder search | Qdrant, FastEmbed, FlashRank |
 | **Knowledge Graph Traversal** | spaCy NER extracts entities from chunks; NetworkX co-occurrence graph enables multi-hop reasoning | spaCy, NetworkX, Redis |
-| **Temporal Versioning** | Tracks `revision_id`, `ingested_at`, and `is_current` per chunk; supports time-travel queries via date picker | Qdrant payload indices |
-| **Self-Healing Sync** | Wikimedia EventStreams SSE listener with version-aware upserts and true revision comparison reconciler | aiohttp, MediaWiki API |
+| **Latest-State Sync** | Live Wikipedia edits trigger atomic chunk replacement (delete-then-upsert) with article-index refresh. Reconciler detects drift. | aiohttp, MediaWiki API |
 | **Agentic Loops** | LangGraph state machine with CRAG grading, Self-RAG hallucination detection, and conditional graph search routing | LangGraph, LangChain |
 | **Query Expansion** | Parallel strategies: Multi-Query, HyDE, Step-Back Abstraction, Query Decomposition | LangChain, OpenAI |
 | **Evaluation Harness** | Automated benchmarking with Recall@K, MRR, Answer Accuracy, and latency percentiles against NQ and TriviaQA | HuggingFace Datasets |
@@ -76,15 +75,15 @@ wikimind/
 |   |-- agent.py              # LangGraph state machine (11 nodes)
 |   |-- article_index.py      # Stage 1: article-level retrieval
 |   |-- knowledge_graph.py    # spaCy NER + NetworkX graph + Redis
-|   |-- retrieval.py          # Stage 2: hybrid search + time-travel
+|   |-- retrieval.py          # Stage 2: hybrid search with typed status
 |   |-- query_expansion.py    # Multi-Query, HyDE, Step-Back, Decomposition
 |   |-- page_index.py         # Vectorless structural navigation
-|   |-- cache.py              # Redis semantic cache
+|   |-- cache.py              # Redis dual-layer cache with strategy-aware keys
 |   |-- main.py               # FastAPI app with /chat, /chat/compare, /health
 |   |-- models.py             # Pydantic request/response schemas
 |   |-- config.py             # Settings management
 |   |-- llmops.py             # Langfuse integration
-|   |-- qdrant_client.py      # Collection init with temporal indices
+|   |-- qdrant_client.py      # Collection initialization
 |   +-- guardrails_config/    # NeMo Guardrails configuration
 |-- data_pipeline/
 |   |-- ingest.py             # Batch ingestion with entity extraction
@@ -178,8 +177,7 @@ Streams the agent's thought process and final answer via SSE.
     "decomposition": false,
     "page_index": false,
     "knowledge_graph": true
-  },
-  "as_of_date": null
+  }
 }
 ```
 

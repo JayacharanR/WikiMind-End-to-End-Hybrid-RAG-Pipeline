@@ -151,15 +151,16 @@ def get_guardrails() -> Optional[LLMRails]:
     Returns:
         Optional[LLMRails]: Initialized guardrails application, or None.
     """
-    config_path = os.path.join(os.path.dirname(__file__), "guardrails_config")
     try:
+        import os
+        config_path = os.path.join(os.path.dirname(__file__), "guardrails_config")
         from backend.agent import _get_llm
         config = RailsConfig.from_path(config_path)
         rails = LLMRails(config, llm=_get_llm())
         logger.info("NeMo Guardrails initialized from %s", config_path)
         return rails
     except Exception as exc:
-        logger.warning("NeMo Guardrails initialization failed: %s", exc)
+        logger.warning("NeMo Guardrails unavailable (non-fatal): %s", exc)
         return None
 
 

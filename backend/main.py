@@ -87,9 +87,16 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         logger.warning("Redis connection failed during startup: %s", exc)
 
-    # Pre-initialize Guardrails
-    from backend.llmops import get_guardrails
-    get_guardrails()
+    # Pre-initialize Guardrails (non-fatal if unavailable)
+    try:
+        from backend.llmops import get_guardrails
+        rails = get_guardrails()
+        if rails:
+            logger.info("NeMo Guardrails loaded successfully.")
+        else:
+            logger.info("NeMo Guardrails not available — running without safety rails.")
+    except Exception as exc:
+        logger.warning("Guardrails initialization failed (non-fatal): %s", exc)
     
     # Initialize Qdrant collections (chunk-level + article-level)
     from backend.qdrant_client import init_collection
@@ -180,18 +187,32 @@ async def health_check():
     except Exception as exc:
         components.append(ServiceStatus(name="redis", healthy=False, detail=str(exc)))
 
-    # Qdrant health
+    # Qdrant health — branch on local vs remote mode
     settings = get_settings()
-    try:
-        import httpx
-        start = time.monotonic()
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(f"{settings.qdrant_url}/healthz")
+    if settings.qdrant_mode == "local":
+        try:
+            from backend.qdrant_client import get_qdrant
+            start = time.monotonic()
+            client = get_qdrant()
+            cols = client.get_collections().collections
             latency = (time.monotonic() - start) * 1000
-            healthy = resp.status_code == 200
-            components.append(ServiceStatus(name="qdrant", healthy=healthy, latency_ms=round(latency, 2)))
-    except Exception as exc:
-        components.append(ServiceStatus(name="qdrant", healthy=False, detail=str(exc)))
+            components.append(ServiceStatus(
+                name="qdrant", healthy=True, latency_ms=round(latency, 2),
+                detail=f"local, {len(cols)} collection(s)",
+            ))
+        except Exception as exc:
+            components.append(ServiceStatus(name="qdrant", healthy=False, detail=str(exc)))
+    else:
+        try:
+            import httpx
+            start = time.monotonic()
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                resp = await client.get(f"{settings.qdrant_url}/healthz")
+                latency = (time.monotonic() - start) * 1000
+                healthy = resp.status_code == 200
+                components.append(ServiceStatus(name="qdrant", healthy=healthy, latency_ms=round(latency, 2)))
+        except Exception as exc:
+            components.append(ServiceStatus(name="qdrant", healthy=False, detail=str(exc)))
 
     # Langfuse health
     langfuse = get_langfuse_client()
@@ -226,14 +247,23 @@ async def chat_endpoint(request: ChatRequest):
     query = request.query
 
     # Cache-first: check L1 and L2 before running the agent
+    strategy_flags = request.strategies.model_dump()
     try:
-        cached_response, cache_level = await cache_lookup(query)
+        cached_response, cache_level = await cache_lookup(query, strategies=strategy_flags)
     except Exception as exc:
         logger.warning("Cache lookup infrastructure failure (degraded mode): %s", exc)
         cached_response, cache_level = None, None
 
     if cached_response is not None:
         logger.info("Serving cached response (level=%s) for: %s", cache_level, query[:60])
+        # Record trace for cache hits so dashboard metrics are accurate
+        _record_trace(
+            query=query,
+            final_state={"generation": cached_response.get("answer", "")},
+            latency_ms=0,
+            cache_hit=True,
+            strategies=[],
+        )
         return JSONResponse(content={
             "answer": cached_response.get("answer", ""),
             "sources": cached_response.get("sources", []),
@@ -348,7 +378,7 @@ async def chat_endpoint(request: ChatRequest):
                     and "Error generating response" not in answer_text
                 )
                 if is_cacheable:
-                    asyncio.create_task(cache_store(query, final_response))
+                    asyncio.create_task(cache_store(query, final_response, strategies=strategy_flags))
                 
                 # Record trace for dashboard
                 trace_latency = (time.time() - _sse_start_time) * 1000
@@ -367,10 +397,12 @@ async def chat_endpoint(request: ChatRequest):
                 }
                 
         except Exception as exc:
-            logger.error("Error during LangGraph streaming: %s", exc)
+            import uuid as _uuid
+            error_id = str(_uuid.uuid4())[:8]
+            logger.error("Error during LangGraph streaming [%s]: %s", error_id, exc)
             yield {
                 "event": "error",
-                "data": json.dumps({"detail": str(exc)})
+                "data": json.dumps({"detail": f"An internal error occurred. Reference: {error_id}"})
             }
             
     return EventSourceResponse(sse_generator())
@@ -544,6 +576,7 @@ async def api_metrics():
 @app.get("/api/traces")
 async def api_traces(limit: int = 100):
     """Return the last N query traces for the dashboard."""
+    limit = max(1, min(limit, 500))  # Cap to prevent abuse
     traces = list(_trace_log)
     return {"traces": list(reversed(traces[-limit:]))}
 
@@ -566,9 +599,16 @@ async def api_eval_results():
         try:
             data = json_mod.loads(f.read_text(encoding="utf-8"))
             # Normalize keys for dashboard compatibility
+            agg = data.get("aggregates", data.get("aggregate", {}))
+            # Normalize metric names: evaluator uses 'mean_answer_accuracy'
+            # but dashboard reads 'mean_accuracy'; same for step_count
+            if "mean_answer_accuracy" in agg and "mean_accuracy" not in agg:
+                agg["mean_accuracy"] = agg["mean_answer_accuracy"]
+            if "mean_step_count" in agg and "mean_steps" not in agg:
+                agg["mean_steps"] = agg["mean_step_count"]
             normalized = {
                 "filename": f.name,
-                "aggregate": data.get("aggregates", data.get("aggregate", {})),
+                "aggregate": agg,
                 "per_query": data.get("per_query_results", data.get("per_query", [])),
                 "dataset": data.get("dataset", ""),
                 "timestamp": data.get("timestamp", ""),

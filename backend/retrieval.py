@@ -212,10 +212,14 @@ async def hybrid_search(
                 doc["content"] = doc.pop("text")
 
             logger.info("Reranked to top %d candidates.", len(top_documents))
+            metadata["retrieval_status"] = "ok"
             return top_documents, metadata
         else:
+            metadata["retrieval_status"] = "no_results"
             return [], metadata
 
     except Exception as exc:
         logger.error("Hybrid search failed: %s", exc)
+        metadata["retrieval_status"] = "unavailable"
+        metadata["retrieval_error"] = type(exc).__name__
         return [], metadata

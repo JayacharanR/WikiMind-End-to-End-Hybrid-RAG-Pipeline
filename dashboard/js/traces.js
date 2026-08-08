@@ -19,6 +19,20 @@ function truncate(str, len = 60) {
   return str.length > len ? str.slice(0, len) + '…' : str;
 }
 
+/**
+ * Escape HTML special characters to prevent XSS when interpolating
+ * user queries and model-generated content into innerHTML.
+ */
+function escapeHtml(str) {
+  if (!str) return '';
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 function attrBadge(attr) {
   switch (attr) {
     case 'rag_grounded': return '<span class="badge badge-success">RAG Grounded</span>';
@@ -76,7 +90,7 @@ export function renderTraceTable(tbodyId, traces) {
           <div style="font-size:0.8rem">${formatTime(t.timestamp)}</div>
         </td>
         <td style="max-width:280px">
-          <div style="font-size:0.8rem;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${truncate(t.query, 55)}</div>
+          <div style="font-size:0.8rem;color:var(--text-primary);white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${escapeHtml(truncate(t.query, 55))}</div>
         </td>
         <td class="mono right" style="color:${latencyColor}">${(t.latency_ms / 1000).toFixed(2)}s</td>
         <td class="mono right">${t.steps}</td>
@@ -105,10 +119,10 @@ function renderDetailContent(trace) {
       <!-- Left: Query & Generation -->
       <div>
         <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:0.5rem">Query</div>
-        <div style="font-size:0.8rem;color:var(--text-primary);margin-bottom:1rem;line-height:1.5">${trace.query || '—'}</div>
+        <div style="font-size:0.8rem;color:var(--text-primary);margin-bottom:1rem;line-height:1.5">${escapeHtml(trace.query) || '—'}</div>
 
         <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:0.5rem">Generation</div>
-        <div style="font-size:0.8rem;color:var(--text-secondary);line-height:1.6;max-height:200px;overflow-y:auto">${trace.generation || '—'}</div>
+        <div style="font-size:0.8rem;color:var(--text-secondary);line-height:1.6;max-height:200px;overflow-y:auto">${escapeHtml(trace.generation) || '—'}</div>
       </div>
 
       <!-- Right: Metadata -->
@@ -143,14 +157,14 @@ function renderDetailContent(trace) {
         ${trace.expanded_queries && trace.expanded_queries.length > 0 ? `
           <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:0.25rem;margin-top:0.5rem">Expanded Queries</div>
           <ul style="font-size:0.75rem;color:var(--text-tertiary);list-style:disc;padding-left:1rem">
-            ${trace.expanded_queries.map(q => `<li>${truncate(q, 80)}</li>`).join('')}
+            ${trace.expanded_queries.map(q => `<li>${escapeHtml(truncate(q, 80))}</li>`).join('')}
           </ul>
         ` : ''}
 
         ${citationEntries.length > 0 ? `
           <div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.05em;color:var(--text-muted);margin-bottom:0.25rem;margin-top:0.75rem">Citations</div>
           <div style="font-size:0.75rem;color:var(--text-tertiary)">
-            ${citationEntries.map(([k, v]) => `<div>[${k}] ${truncate(v.title || v.content || '', 60)}</div>`).join('')}
+            ${citationEntries.map(([k, v]) => `<div>[${escapeHtml(k)}] ${escapeHtml(truncate(v.title || v.content || '', 60))}</div>`).join('')}
           </div>
         ` : ''}
       </div>

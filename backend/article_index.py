@@ -183,3 +183,47 @@ def extract_article_summary(title: str, full_text: str, max_chars: int = 1500) -
     first_paragraphs = "\n\n".join(paragraphs[:2]) if paragraphs else ""
     summary = f"{title}\n\n{first_paragraphs}"
     return summary[:max_chars]
+
+
+async def upsert_article(title: str, summary_text: str, url: str = "") -> None:
+    """Upsert a single article into the article-level index.
+
+    Used by the live sync worker to refresh the Stage 1 discovery index
+    whenever an article is re-ingested.
+
+    Args:
+        title: The Wikipedia article title.
+        summary_text: Summary text to embed (title + first paragraphs).
+        url: Optional article URL.
+    """
+    settings = get_settings()
+    dense_model = get_dense_model()
+    article_id = generate_article_id(title)
+
+    # Generate embedding
+    embedding = list(dense_model.embed([summary_text]))[0].tolist()
+
+    point = models.PointStruct(
+        id=article_id,
+        vector=embedding,
+        payload={
+            "title": title,
+            "url": url,
+            "summary": summary_text[:500],
+        },
+    )
+
+    qdrant = get_async_qdrant()
+    if qdrant is not None:
+        await qdrant.upsert(
+            collection_name=settings.article_collection,
+            points=[point],
+        )
+    else:
+        sync_client = get_sync_qdrant()
+        await asyncio.to_thread(
+            sync_client.upsert,
+            collection_name=settings.article_collection,
+            points=[point],
+        )
+    logger.debug("Upserted article index entry for '%s'", title)
