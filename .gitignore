@@ -51,4 +51,4 @@ checkpoints/
 storage/
 .qdrant-initialized
 
-CODE_REVIEW_REPORT.md
+CODE_REVIEW_REPORT*.md
