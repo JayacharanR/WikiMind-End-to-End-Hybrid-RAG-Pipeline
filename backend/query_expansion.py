@@ -10,7 +10,7 @@ Implements four distinct query expansion strategies to improve retrieval recall:
 import logging
 from typing import List
 
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_openai import ChatOpenAI
 
 from backend.config import get_settings
@@ -21,8 +21,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Prompts
 # ---------------------------------------------------------------------------
-
-from langchain_core.prompts import PromptTemplate
 
 MULTI_QUERY_PROMPT = PromptTemplate.from_template(
     "You are an AI language model assistant. Your task is to generate 3 different versions of the given user query to retrieve relevant documents from a vector database.\n"
@@ -56,6 +54,7 @@ DECOMPOSITION_PROMPT = PromptTemplate.from_template(
 # ---------------------------------------------------------------------------
 # Strategies
 # ---------------------------------------------------------------------------
+
 
 async def _generate_multi_queries(query: str, llm: ChatOpenAI) -> List[str]:
     """Generate multiple semantic reformulations of the query."""
@@ -112,54 +111,60 @@ async def _generate_decomposition(query: str, llm: ChatOpenAI) -> List[str]:
 # Main Router
 # ---------------------------------------------------------------------------
 
+
 async def expand_query(query: str, strategies: QueryStrategies) -> List[str]:
     """Apply the active query expansion strategies to generate additional search queries.
-    
+
     Args:
         query: The original user query.
         strategies: Pydantic model defining which strategies are toggled on.
-        
+
     Returns:
         A list of generated queries, plus the original query as the first item.
     """
     expanded_queries = [query]
-    
+
     # If no strategies are active, return just the original query
-    if not (strategies.multi_query or strategies.hyde or strategies.step_back or strategies.decomposition):
+    if not (
+        strategies.multi_query
+        or strategies.hyde
+        or strategies.step_back
+        or strategies.decomposition
+    ):
         return expanded_queries
-        
+
     settings = get_settings()
     llm = ChatOpenAI(
         model=settings.openrouter_model,
         api_key=settings.openrouter_api_key,
         base_url=settings.llm_base_url,
-        temperature=0.2
+        temperature=0.2,
     )
-    
+
     logger.info("Applying active query expansion strategies...")
-    
+
     # Run active strategies sequentially (or concurrently in a production environment)
     # For MVP, we use sequential await to simplify error handling
     if strategies.multi_query:
         logger.debug("Applying Multi-Query expansion...")
         mq = await _generate_multi_queries(query, llm)
         expanded_queries.extend(mq)
-        
+
     if strategies.hyde:
         logger.debug("Applying HyDE expansion...")
         hyde = await _generate_hyde(query, llm)
         expanded_queries.extend(hyde)
-        
+
     if strategies.step_back:
         logger.debug("Applying Step-Back expansion...")
         sb = await _generate_step_back(query, llm)
         expanded_queries.extend(sb)
-        
+
     if strategies.decomposition:
         logger.debug("Applying Decomposition expansion...")
         decomp = await _generate_decomposition(query, llm)
         expanded_queries.extend(decomp)
-        
+
     # Deduplicate queries while preserving order
     seen = set()
     unique_queries = []
@@ -167,7 +172,7 @@ async def expand_query(query: str, strategies: QueryStrategies) -> List[str]:
         # Ignore LLM tool-calling hallucinations (e.g. {"name": "search_wikipedia"...})
         if "{" in q and "}" in q and '"name"' in q:
             continue
-            
+
         q_lower = q.lower()
         if q_lower not in seen:
             seen.add(q_lower)

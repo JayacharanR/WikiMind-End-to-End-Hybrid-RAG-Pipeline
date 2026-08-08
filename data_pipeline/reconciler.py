@@ -35,69 +35,68 @@ SAMPLE_SIZE = 100
 
 async def get_random_titles_from_qdrant(limit: int = SAMPLE_SIZE) -> List[str]:
     """Sample random article titles from the article-level index.
-    
+
     Uses the ``wikimind_articles`` collection (one point per article) instead
     of the chunk collection, so each scroll result is a unique article.
-    Applies a random offset to avoid always sampling the same first page.
+    Uses reservoir sampling over valid Qdrant scroll cursors to avoid relying
+    on fabricated point-ID offsets.
     """
     qdrant = get_async_qdrant()
     settings = get_settings()
     # Prefer the article-level collection for sampling (1 point per article)
     collection = settings.article_collection
-    
+
     try:
-        # Get collection stats to find total articles
+        # Qdrant scroll offsets are point IDs/cursors, not random numeric
+        # positions. Use reservoir sampling over real scroll pages instead of
+        # passing an arbitrary UUID that is unlikely to exist in the index.
         col_info = await qdrant.get_collection(collection_name=collection)
         total_points = col_info.points_count
-        
         if total_points == 0:
-            # Fallback to chunk collection if article index is empty
             collection = settings.qdrant_collection
             col_info = await qdrant.get_collection(collection_name=collection)
             total_points = col_info.points_count
             if total_points == 0:
                 return []
-        
-        # Use random offset for diverse sampling across the collection.
-        # Generate a random UUID as a starting point for scroll so each
-        # reconciliation cycle checks a different region of the collection.
-        import uuid
-        max_offset = max(0, total_points - limit)
-        random_offset_id = str(uuid.UUID(int=random.randint(0, 2**128 - 1)))
 
-        results, _ = await qdrant.scroll(
-            collection_name=collection,
-            limit=min(limit * 3, total_points),  # Over-fetch to account for dedup
-            offset=random_offset_id,
-            with_payload=["title"],
-            with_vectors=False
+        reservoir: List[str] = []
+        seen_titles = set()
+        seen_count = 0
+        offset = None
+        while True:
+            kwargs = {
+                "collection_name": collection,
+                "limit": 256,
+                "with_payload": ["title"],
+                "with_vectors": False,
+            }
+            if offset is not None:
+                kwargs["offset"] = offset
+            results, next_offset = await qdrant.scroll(**kwargs)
+
+            for point in results:
+                title = (point.payload or {}).get("title") if point.payload else None
+                if not title or title in seen_titles:
+                    continue
+                seen_titles.add(title)
+                seen_count += 1
+                if len(reservoir) < limit:
+                    reservoir.append(title)
+                else:
+                    replacement = random.randrange(seen_count)
+                    if replacement < limit:
+                        reservoir[replacement] = title
+
+            if next_offset is None:
+                break
+            offset = next_offset
+
+        logger.info(
+            "Reconciler sampled %d unique titles from %d indexed points",
+            len(reservoir),
+            total_points,
         )
-
-        # If random offset returned fewer results than desired, wrap around
-        # with a second scroll from the start
-        if len(results) < limit * 2:
-            wrap_results, _ = await qdrant.scroll(
-                collection_name=collection,
-                limit=min(limit * 2, total_points),
-                with_payload=["title"],
-                with_vectors=False
-            )
-            results = list(results) + list(wrap_results)
-
-        # Deduplicate titles and randomly sample from results
-        all_titles = list(set(
-            point.payload.get("title")
-            for point in results
-            if point.payload and point.payload.get("title")
-        ))
-        
-        # Random sample if we have more than requested
-        if len(all_titles) > limit:
-            all_titles = random.sample(all_titles, limit)
-        
-        logger.info("Reconciler sampled %d unique titles from %d total points (offset=%s...)", 
-                     len(all_titles), total_points, random_offset_id[:8])
-        return all_titles
+        return reservoir
     except Exception as exc:
         logger.error("Error sampling from Qdrant: %s", exc)
         return []
@@ -125,7 +124,7 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
 
     # Batch fetch live revision IDs from MediaWiki API (up to 50 per request)
     for batch_start in range(0, len(titles), 50):
-        batch = titles[batch_start:batch_start + 50]
+        batch = titles[batch_start : batch_start + 50]
         params = {
             "action": "query",
             "format": "json",
@@ -162,13 +161,16 @@ async def check_live_revisions(session: aiohttp.ClientSession, titles: List[str]
                     if rev_source == "dataset_snapshot":
                         logger.info(
                             "Refreshing '%s': batch-ingested (source_document_id=%s, not a revid)",
-                            page_title, stored_revid,
+                            page_title,
+                            stored_revid,
                         )
                         stale_titles.append((page_title, live_revid))
                     elif stored_revid and stored_revid != live_revid:
                         logger.info(
                             "Drift detected for '%s': stored=%s, live=%s",
-                            page_title, stored_revid, live_revid,
+                            page_title,
+                            stored_revid,
+                            live_revid,
                         )
                         stale_titles.append((page_title, live_revid))
                     elif not stored_revid:
@@ -193,6 +195,7 @@ async def _get_stored_revision(title: str) -> tuple:
 
     try:
         from qdrant_client.http import models as qmodels
+
         results, _ = await qdrant.scroll(
             collection_name=settings.qdrant_collection,
             scroll_filter=qmodels.Filter(
@@ -231,45 +234,51 @@ async def run_reconciliation_cycle():
         titles = await get_random_titles_from_qdrant(limit=SAMPLE_SIZE)
         if not titles:
             logger.info("Qdrant collection empty. Sleeping...")
-            return
-            
-        logger.info("Sampled %d unique articles for reconciliation.", len(titles))
-        
-        headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
-        async with aiohttp.ClientSession(headers=headers) as session:
-            stale_titles = await check_live_revisions(session, titles)
-            drift_count = len(stale_titles)
-            
-            if stale_titles:
-                logger.warning("Detected drift in %d articles. Re-ingesting...", len(stale_titles))
-                for title, live_rev in stale_titles:
-                    fake_event = {
-                        "title": title,
-                        "meta": {"uri": f"https://en.wikipedia.org/wiki/{title}"},
-                        "revision": {"new": live_rev},
-                    }
-                    try:
-                        await process_event(fake_event, session)
-                        success_count += 1
-                        reconciler_health.record_success(event_id=title)
-                        logger.info("Re-ingestion succeeded for '%s'", title)
-                    except Exception as exc:
-                        failed_count += 1
-                        reconciler_health.add_to_dlq(
-                            event=fake_event, error_msg=str(exc)
-                        )
-                        logger.warning("Re-ingestion failed for '%s': %s", title, exc)
-            else:
-                logger.info("No drift detected in sample.")
+        else:
+            logger.info("Sampled %d unique articles for reconciliation.", len(titles))
 
-        # Retry any DLQ items from previous cycles
-        if reconciler_health.dlq:
-            logger.info("Retrying %d DLQ items from previous cycles...", len(reconciler_health.dlq))
-            async with aiohttp.ClientSession(headers=headers) as retry_session:
-                await reconciler_health.retry_dlq(
-                    process_fn=process_event,
-                    session=retry_session,
+            headers = {
+                "User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"
+            }
+            async with aiohttp.ClientSession(headers=headers) as session:
+                stale_titles = await check_live_revisions(session, titles)
+                drift_count = len(stale_titles)
+
+                if stale_titles:
+                    logger.warning(
+                        "Detected drift in %d articles. Re-ingesting...", len(stale_titles)
+                    )
+                    for title, live_rev in stale_titles:
+                        fake_event = {
+                            "title": title,
+                            "meta": {
+                                "uri": f"https://en.wikipedia.org/wiki/{title.replace(' ', '_')}"
+                            },
+                            "revision": {"new": live_rev},
+                            "type": "edit",
+                        }
+                        try:
+                            await process_event(fake_event, session)
+                            success_count += 1
+                            reconciler_health.record_success(event_id=title)
+                            logger.info("Re-ingestion succeeded for '%s'", title)
+                        except Exception as exc:
+                            failed_count += 1
+                            reconciler_health.add_to_dlq(event=fake_event, error_msg=str(exc))
+                            logger.warning("Re-ingestion failed for '%s': %s", title, exc)
+                else:
+                    logger.info("No drift detected in sample.")
+
+            # Retry any DLQ items from previous cycles
+            if reconciler_health.dlq:
+                logger.info(
+                    "Retrying %d DLQ items from previous cycles...", len(reconciler_health.dlq)
                 )
+                async with aiohttp.ClientSession(headers=headers) as retry_session:
+                    await reconciler_health.retry_dlq(
+                        process_fn=process_event,
+                        session=retry_session,
+                    )
 
     except Exception as exc:
         reconciler_health.record_failure(error=str(exc))
@@ -285,7 +294,10 @@ async def run_reconciliation_cycle():
     )
     logger.info(
         "Reconciliation cycle complete: drift=%d, success=%d, failed=%d, elapsed=%.1fs",
-        drift_count, success_count, failed_count, elapsed,
+        drift_count,
+        success_count,
+        failed_count,
+        elapsed,
     )
 
 
@@ -294,22 +306,26 @@ async def reconcile_loop():
     settings = get_settings()
     interval_hours = settings.wiki_reconcile_interval_hours
     interval_seconds = interval_hours * 3600
-    
+
     logger.info("Starting State Reconciliation Worker. Interval: %dh", interval_hours)
-    
+
     while True:
         start_time = time.time()
-        
+
         await run_reconciliation_cycle()
-                
+
         # Flush traces
         langfuse = get_langfuse_client()
         if langfuse:
             langfuse.flush()
-            
+
         elapsed = time.time() - start_time
         sleep_time = max(0, interval_seconds - elapsed)
-        logger.info("Reconciliation cycle complete (took %.1fs). Sleeping for %.1fh...", elapsed, sleep_time / 3600)
+        logger.info(
+            "Reconciliation cycle complete (took %.1fs). Sleeping for %.1fh...",
+            elapsed,
+            sleep_time / 3600,
+        )
         await asyncio.sleep(sleep_time)
 
 

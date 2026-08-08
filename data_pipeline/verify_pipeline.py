@@ -2,7 +2,7 @@
 
 End-to-end verification of the WikiMind data pipeline:
 1. Qdrant connectivity and collection health
-2. Wiki updater: process_event() with a real Wikipedia article
+2. Wiki updater: process_event() with a deterministic local fixture
 3. Reconciler: run_reconciliation_cycle() validation
 4. DLQ and health tracker behavior
 5. Cache L1 + L2 functionality
@@ -13,7 +13,6 @@ Usage::
 """
 
 import asyncio
-import json
 import logging
 import sys
 import time
@@ -30,18 +29,12 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Proper User-Agent required by MediaWiki API
-WIKI_USER_AGENT = (
-    "WikiMindBot/1.0 (https://github.com/JayacharanR/"
-    "End-to-End-Hybrid-RAG-Pipeline; charan@wikimind.dev)"
-)
-
 
 def _header(title: str) -> None:
     """Print a test section header."""
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"  {title}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
 
 
 def _result(test: str, passed: bool, detail: str = "") -> None:
@@ -54,14 +47,38 @@ def _result(test: str, passed: bool, detail: str = "") -> None:
 
 
 async def test_qdrant_health() -> bool:
-    """Test 1: Qdrant server connectivity."""
+    """Test 1: Qdrant connectivity in local or remote mode."""
     _header("Test 1: Qdrant Health Check")
 
     try:
         from backend.config import get_settings
+
         settings = get_settings()
 
+        if settings.qdrant_mode == "local":
+            from backend.qdrant_client import get_sync_qdrant
+
+            client = get_sync_qdrant()
+            collections = await asyncio.to_thread(client.get_collections)
+            collection_names = [collection.name for collection in collections.collections]
+            _result(
+                "Embedded Qdrant reachable",
+                True,
+                f"path={settings.qdrant_local_path}",
+            )
+            _result(
+                "Collections found",
+                len(collection_names) > 0,
+                ", ".join(collection_names) if collection_names else "none",
+            )
+            for coll_name in [settings.qdrant_collection, settings.article_collection]:
+                if coll_name in collection_names:
+                    info = await asyncio.to_thread(client.get_collection, collection_name=coll_name)
+                    _result(f"  {coll_name}", True, f"{info.points_count:,} points")
+            return bool(collection_names)
+
         import httpx
+
         async with httpx.AsyncClient(timeout=5.0) as client:
             resp = await client.get(f"{settings.qdrant_url}/healthz")
             healthy = resp.status_code == 200
@@ -72,7 +89,11 @@ async def test_qdrant_health() -> bool:
                 resp = await client.get(f"{settings.qdrant_url}/collections")
                 data = resp.json()
                 collections = [c["name"] for c in data.get("result", {}).get("collections", [])]
-                _result("Collections found", len(collections) > 0, ", ".join(collections) if collections else "none")
+                _result(
+                    "Collections found",
+                    len(collections) > 0,
+                    ", ".join(collections) if collections else "none",
+                )
 
                 # Check chunk count
                 for coll_name in [settings.qdrant_collection, settings.article_collection]:
@@ -89,45 +110,54 @@ async def test_qdrant_health() -> bool:
 
 
 async def test_existing_data() -> bool:
-    """Test 2a: Verify articles already exist in Qdrant (from prior ingestion)."""
+    """Test 2a: Verify the article and chunk indexes contain aligned data."""
     _header("Test 2a: Verify Existing Data in Qdrant")
 
     try:
-        from backend.qdrant_client import get_async_qdrant
-        from backend.config import get_settings
         from qdrant_client.http import models as qmodels
+
+        from backend.config import get_settings
+        from backend.qdrant_client import get_async_qdrant
 
         qdrant = get_async_qdrant()
         settings = get_settings()
 
-        # Check for articles that should exist:
-        # - "Sean Woods" is from the batch ingestion (confirmed in collection)
-        # - "Guido van Rossum" may exist from process_event test
-        test_titles = ["Sean Woods", "Guido van Rossum", "Adolf Weil (physician)"]
-        found = 0
+        article_points, _ = await qdrant.scroll(
+            collection_name=settings.article_collection,
+            limit=1,
+            with_payload=["title"],
+            with_vectors=False,
+        )
+        if not article_points:
+            _result("Article-level data", False, "article collection is empty")
+            return False
 
-        for title in test_titles:
-            results, _ = await qdrant.scroll(
-                collection_name=settings.qdrant_collection,
-                scroll_filter=qmodels.Filter(
-                    must=[
-                        qmodels.FieldCondition(
-                            key="title",
-                            match=qmodels.MatchValue(value=title),
-                        ),
-                    ]
-                ),
-                limit=5,
-                with_payload=["title", "chunk_index"],
-                with_vectors=False,
-            )
-            if len(results) > 0:
-                found += 1
-                _result(f"'{title}'", True, f"{len(results)}+ chunks present")
-            else:
-                _result(f"'{title}'", False, "not found in collection")
+        title = (article_points[0].payload or {}).get("title", "")
+        _result("Article-level data", bool(title), title or "missing title payload")
+        if not title:
+            return False
 
-        return found > 0
+        chunk_points, _ = await qdrant.scroll(
+            collection_name=settings.qdrant_collection,
+            scroll_filter=qmodels.Filter(
+                must=[
+                    qmodels.FieldCondition(
+                        key="title",
+                        match=qmodels.MatchValue(value=title),
+                    ),
+                ]
+            ),
+            limit=5,
+            with_payload=["title", "chunk_index"],
+            with_vectors=False,
+        )
+        aligned = bool(chunk_points)
+        _result(
+            "Matching chunk data",
+            aligned,
+            f"'{title}' has {len(chunk_points)}+ chunks" if aligned else "not found",
+        )
+        return aligned
 
     except Exception as exc:
         _result("Existing data check", False, str(exc))
@@ -135,41 +165,54 @@ async def test_existing_data() -> bool:
 
 
 async def test_process_event() -> bool:
-    """Test 2b: Process a single Wikipedia article edit event via the updater."""
+    """Test 2b: Process and shrink a deterministic article fixture."""
     _header("Test 2b: Wiki Updater -- process_event()")
 
     try:
-        import aiohttp
+        from unittest.mock import AsyncMock, patch
+
         from data_pipeline.wiki_updater import process_event, updater_health
 
-        # Use a small article to keep the test fast
+        # Keep this test independent of external Wikipedia network access.
+        test_title = "WikiMind Verification Fixture"
         test_event = {
-            "title": "Guido van Rossum",
+            "title": test_title,
             "type": "edit",
             "namespace": 0,
             "revision": {"new": 999999999},
             "meta": {
-                "uri": "https://en.wikipedia.org/wiki/Guido_van_Rossum",
+                "uri": "https://en.wikipedia.org/wiki/WikiMind_Verification_Fixture",
             },
         }
 
-        timeout = aiohttp.ClientTimeout(total=30)
-        headers = {"User-Agent": WIKI_USER_AGENT}
-        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+        long_text = " ".join(
+            ["WikiMind verification fixture contains deterministic test content."] * 180
+        )
+        short_text = "WikiMind verification fixture was successfully shrunk."
+        fake_session = object()
+        with patch(
+            "data_pipeline.wiki_updater.fetch_article_text",
+            new=AsyncMock(side_effect=[long_text, short_text]),
+        ):
             start = time.time()
-            await process_event(test_event, session)
+            await process_event(test_event, fake_session)
+            # A second update is intentionally shorter to verify stale chunk
+            # removal instead of merely testing a same-size overwrite.
+            test_event["revision"]["new"] = 1000000000
+            await process_event(test_event, fake_session)
             elapsed = time.time() - start
 
             _result(
                 "process_event() completed",
                 True,
-                f"'{test_event['title']}' processed in {elapsed:.1f}s",
+                f"'{test_event['title']}' processed and shrunk in {elapsed:.1f}s",
             )
 
             # Verify chunks were written to Qdrant
+            from qdrant_client.http import models as qmodels
+
             from backend.config import get_settings
             from backend.qdrant_client import get_async_qdrant
-            from qdrant_client.http import models as qmodels
 
             settings = get_settings()
             qdrant = get_async_qdrant()
@@ -184,16 +227,16 @@ async def test_process_event() -> bool:
                         ),
                     ]
                 ),
-                limit=5,
+                limit=20,
                 with_payload=["title", "chunk_index"],
                 with_vectors=False,
             )
 
             chunk_count = len(results)
             _result(
-                "Chunks in Qdrant after upsert",
-                chunk_count > 0,
-                f"{chunk_count} chunks found (showing first 5)",
+                "Stale chunks removed after shrink",
+                chunk_count == 1,
+                f"{chunk_count} chunks found",
             )
 
             # Check health tracker
@@ -204,7 +247,23 @@ async def test_process_event() -> bool:
                 f"processed={health['events_processed']}, failed={health['events_failed']}, dlq={health['dlq_size']}",
             )
 
-            return chunk_count > 0
+            # Keep the verification fixture out of the persistent local store.
+            await qdrant.delete(
+                collection_name=settings.qdrant_collection,
+                points_selector=qmodels.FilterSelector(
+                    filter=qmodels.Filter(
+                        must=[
+                            qmodels.FieldCondition(
+                                key="title", match=qmodels.MatchValue(value=test_title)
+                            )
+                        ]
+                    )
+                ),
+            )
+            from backend.article_index import delete_article
+
+            await delete_article(test_title)
+            return chunk_count == 1
 
     except Exception as exc:
         _result("process_event()", False, str(exc))
@@ -237,13 +296,21 @@ async def test_dlq_behavior() -> bool:
 
         # Verify DLQ persistence
         import os
+
         dlq_path = tracker._dlq_path
         persisted = os.path.exists(dlq_path)
         _result("DLQ persisted to disk", persisted, dlq_path if persisted else "file not found")
 
         # Test health status format
-        required_keys = ["worker", "status", "events_processed", "events_failed", "dlq_size",
-                         "last_heartbeat", "consecutive_failures"]
+        required_keys = [
+            "worker",
+            "status",
+            "events_processed",
+            "events_failed",
+            "dlq_size",
+            "last_heartbeat",
+            "consecutive_failures",
+        ]
         has_all = all(k in health for k in required_keys)
         _result("Health status schema", has_all, f"keys={list(health.keys())}")
 
@@ -301,7 +368,7 @@ async def test_cache_l1() -> bool:
     _header("Test 5: Cache L1 (Exact Match)")
 
     try:
-        from backend.cache import l1_get, l1_set, get_redis_client
+        from backend.cache import cache_invalidate, get_redis_client, l1_get, l1_set
 
         # Check Redis connectivity first
         try:
@@ -322,17 +389,18 @@ async def test_cache_l1() -> bool:
 
         result = await l1_get(test_query)
         hit = result is not None and result.get("answer") == test_response["answer"]
-        _result("L1 GET (exact match)", hit, f"got: {result.get('answer', 'None')[:50]}" if result else "miss")
+        _result(
+            "L1 GET (exact match)",
+            hit,
+            f"got: {result.get('answer', 'None')[:50]}" if result else "miss",
+        )
 
         # Test miss
         result = await l1_get("completely_different_query_that_should_miss")
         _result("L1 MISS (different query)", result is None, "correctly returned None")
 
-        # Clean up
-        key_hash = f"wikimind:cache:l1:" + __import__("hashlib").sha256(
-            test_query.strip().lower().rstrip("?.!").encode()
-        ).hexdigest()
-        await client.delete(key_hash)
+        # Clean up the generation-aware key.
+        await cache_invalidate(test_query)
 
         return hit
 
@@ -346,7 +414,13 @@ async def test_cache_l2() -> bool:
     _header("Test 6: Cache L2 (Semantic -- Pure-Redis Fallback)")
 
     try:
-        from backend.cache import l2_get, l2_set, _init_l2_strategy, get_redis_client
+        from backend.cache import (
+            _init_l2_strategy,
+            cache_invalidate,
+            get_redis_client,
+            l2_get,
+            l2_set,
+        )
 
         # Check Redis first
         try:
@@ -365,6 +439,7 @@ async def test_cache_l2() -> bool:
             return False
 
         # Test L2 write + read
+        passed = True
         test_query = "What is the capital city of France?"
         test_response = {"answer": "Paris is the capital of France.", "sources": []}
 
@@ -377,6 +452,7 @@ async def test_cache_l2() -> bool:
             _result("L2 GET (exact re-query)", True, f"matched: {result.get('answer', '')[:50]}")
         else:
             _result("L2 GET (exact re-query)", False, "no match returned")
+            passed = False
 
         # Test semantic match with similar query
         similar_query = "What is the capital of France"
@@ -384,14 +460,15 @@ async def test_cache_l2() -> bool:
         if result is not None:
             _result("L2 GET (semantic match)", True, f"matched: {result.get('answer', '')[:50]}")
         else:
-            _result("L2 GET (semantic match)", False, "no semantic match (threshold may be too high)")
+            _result(
+                "L2 GET (semantic match)", False, "no semantic match (threshold may be too high)"
+            )
+            passed = False
 
-        # Clean up L2 pool entries
-        import hashlib
-        key = f"wikimind:cache:l2:pool:{hashlib.md5(test_query.encode()).hexdigest()}"
-        await client.delete(key)
+        # Clean up the strategy/generation-scoped entry.
+        await cache_invalidate(test_query)
 
-        return True
+        return passed
 
     except Exception as exc:
         _result("L2 cache", False, str(exc))
@@ -400,9 +477,9 @@ async def test_cache_l2() -> bool:
 
 async def main():
     """Run all verification tests."""
-    print("\n" + "="*60)
+    print("\n" + "=" * 60)
     print("  WikiMind Pipeline Verification Suite")
-    print("="*60)
+    print("=" * 60)
 
     results = {}
 
@@ -450,7 +527,7 @@ async def main():
         print("\n  NOTE: Cache tests require a running Redis server.")
         print("  Start Redis locally or use: docker run -d -p 6379:6379 redis/redis-stack-server")
 
-    print("="*60)
+    print("=" * 60)
 
     return passed == total
 

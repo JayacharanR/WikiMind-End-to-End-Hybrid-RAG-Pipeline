@@ -6,7 +6,6 @@ every external service the application depends on.
 """
 
 from functools import lru_cache
-from typing import Optional
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -78,6 +77,9 @@ class Settings(BaseSettings):
     app_host: str = "0.0.0.0"
     app_port: int = 8000
     log_level: str = "INFO"
+    api_key: str = ""
+    rate_limit_per_minute: int = 60
+    request_timeout_seconds: float = 120.0
 
     # --- Wikipedia Sync ---------------------------------------------------
     wiki_stream_url: str = "https://stream.wikimedia.org/v2/stream/recentchange"

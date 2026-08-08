@@ -18,7 +18,6 @@ import networkx as nx
 import spacy
 
 from backend.cache import get_redis_client
-from backend.config import get_settings
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +50,7 @@ def _get_nlp() -> spacy.language.Language:
 # ---------------------------------------------------------------------------
 # Entity Extraction
 # ---------------------------------------------------------------------------
+
 
 def extract_entities(text: str) -> List[str]:
     """Extract named entities from a text chunk.
@@ -112,6 +112,7 @@ def build_co_occurrence_edges(
 # ---------------------------------------------------------------------------
 # Graph Persistence (Redis + Local File Fallback)
 # ---------------------------------------------------------------------------
+
 
 def save_graph_to_file(graph: nx.DiGraph) -> None:
     """Save the knowledge graph to a local JSON file as a fallback.
@@ -222,6 +223,7 @@ async def load_graph_from_redis() -> Optional[nx.DiGraph]:
 # Graph Search
 # ---------------------------------------------------------------------------
 
+
 async def graph_search(
     query: str,
     max_hops: int = 2,
@@ -282,30 +284,36 @@ async def graph_search(
             # Collect edge data from predecessors
             for pred in graph.predecessors(current_node):
                 edge_data = graph.get_edge_data(pred, current_node, default={})
-                results.append({
-                    "entity": current_node,
-                    "connected_to": pred,
-                    "relation": edge_data.get("relation", "appears_with"),
-                    "source_title": edge_data.get("source_title", ""),
-                    "hop_distance": distance,
-                })
+                results.append(
+                    {
+                        "entity": current_node,
+                        "connected_to": pred,
+                        "relation": edge_data.get("relation", "appears_with"),
+                        "source_title": edge_data.get("source_title", ""),
+                        "hop_distance": distance,
+                    }
+                )
                 if len(results) >= max_results:
                     break
 
             for succ in graph.successors(current_node):
                 edge_data = graph.get_edge_data(current_node, succ, default={})
-                results.append({
-                    "entity": current_node,
-                    "connected_to": succ,
-                    "relation": edge_data.get("relation", "appears_with"),
-                    "source_title": edge_data.get("source_title", ""),
-                    "hop_distance": distance,
-                })
+                results.append(
+                    {
+                        "entity": current_node,
+                        "connected_to": succ,
+                        "relation": edge_data.get("relation", "appears_with"),
+                        "source_title": edge_data.get("source_title", ""),
+                        "hop_distance": distance,
+                    }
+                )
                 if len(results) >= max_results:
                     break
 
         if distance < max_hops:
-            for neighbor in list(graph.successors(current_node)) + list(graph.predecessors(current_node)):
+            for neighbor in list(graph.successors(current_node)) + list(
+                graph.predecessors(current_node)
+            ):
                 if neighbor not in visited:
                     visited.add(neighbor)
                     frontier.append((neighbor, distance + 1))

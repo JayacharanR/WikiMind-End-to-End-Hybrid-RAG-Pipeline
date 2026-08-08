@@ -16,14 +16,13 @@ import signal
 from typing import Any, Dict, Optional
 
 import aiohttp
-from sse_starlette.sse import ServerSentEvent
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+from qdrant_client.http import models
 
 from backend.config import get_settings
 from backend.qdrant_client import generate_point_id, get_async_qdrant
 from data_pipeline.ingest import get_dense_model, get_sparse_model
 from data_pipeline.pipeline_health import PipelineHealthTracker
-from qdrant_client.http import models
-from langchain_text_splitters import RecursiveCharacterTextSplitter
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger(__name__)
@@ -71,6 +70,63 @@ async def fetch_article_text(session: aiohttp.ClientSession, title: str) -> Opti
     return None
 
 
+def _title_filter(title: str) -> models.Filter:
+    """Build the common Qdrant filter for all points belonging to a title."""
+    return models.Filter(
+        must=[
+            models.FieldCondition(
+                key="title",
+                match=models.MatchValue(value=title),
+            )
+        ]
+    )
+
+
+async def _delete_all_article_chunks(qdrant, collection_name: str, title: str) -> None:
+    """Delete every chunk for an article and fail if Qdrant rejects it."""
+    await qdrant.delete(
+        collection_name=collection_name,
+        points_selector=models.FilterSelector(filter=_title_filter(title)),
+    )
+
+
+async def _remove_stale_article_chunks(
+    qdrant,
+    collection_name: str,
+    title: str,
+    keep_ids: set[str],
+) -> None:
+    """Remove old point IDs after the replacement points are safely upserted.
+
+    Upserting first avoids a temporary data-loss window if embedding or
+    upsert fails. Deleting only IDs that are not part of the new generation
+    also handles articles that shrink and legacy non-contiguous chunk IDs.
+    """
+    stale_ids: list[str] = []
+    offset = None
+    while True:
+        kwargs = {
+            "collection_name": collection_name,
+            "scroll_filter": _title_filter(title),
+            "limit": 256,
+            "with_payload": False,
+            "with_vectors": False,
+        }
+        if offset is not None:
+            kwargs["offset"] = offset
+        points, next_offset = await qdrant.scroll(**kwargs)
+        stale_ids.extend(str(point.id) for point in points if str(point.id) not in keep_ids)
+        if next_offset is None:
+            break
+        offset = next_offset
+
+    if stale_ids:
+        await qdrant.delete(
+            collection_name=collection_name,
+            points_selector=models.PointIdsList(points=stale_ids),
+        )
+
+
 async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSession) -> None:
     """Process a single Wikipedia edit event.
 
@@ -83,16 +139,44 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     meta = event_data.get("meta", {})
     uri = meta.get("uri", "")
     revision_id = str(event_data.get("revision", {}).get("new", ""))
-    
+    event_type = event_data.get("type", "edit")
+
     if not title:
         return
 
     logger.info("Processing update for: %s (revision %s)", title, revision_id)
-    
-    # 1. Fetch updated content
+
+    qdrant = get_async_qdrant()
+    settings = get_settings()
+
+    # Deletion events carry enough information to remove the current state
+    # without making a second API request.
+    if event_type == "delete":
+        await _delete_all_article_chunks(qdrant, settings.qdrant_collection, title)
+        from backend.article_index import delete_article
+
+        await delete_article(title)
+        from backend.cache import bump_cache_generation
+
+        await bump_cache_generation()
+        logger.info("Deleted all indexed state for '%s'", title)
+        return
+
+    # 1. Fetch updated content. None means the fetch failed; an empty string
+    # is a confirmed empty page and must remove the previous indexed state.
     text = await fetch_article_text(session, title)
-    if not text:
+    if text is None:
         raise RuntimeError(f"Failed to fetch article text for '{title}'")
+    if not text.strip():
+        await _delete_all_article_chunks(qdrant, settings.qdrant_collection, title)
+        from backend.article_index import delete_article
+
+        await delete_article(title)
+        from backend.cache import bump_cache_generation
+
+        await bump_cache_generation()
+        logger.info("Removed empty article '%s' from all indexes", title)
+        return
 
     # 2. Chunking
     splitter = RecursiveCharacterTextSplitter(
@@ -102,45 +186,26 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
     )
     chunks = splitter.split_text(text)
     if not chunks:
-        return
+        raise RuntimeError(f"Article '{title}' produced no chunks")
 
     # 3. Embedding
-    qdrant = get_async_qdrant()
-    settings = get_settings()
     dense_model = get_dense_model()
     sparse_model = get_sparse_model()
-    dense_embeddings = list(dense_model.embed(chunks))
-    sparse_embeddings = list(sparse_model.embed(chunks))
+    dense_embeddings, sparse_embeddings = await asyncio.gather(
+        asyncio.to_thread(lambda: list(dense_model.embed(chunks))),
+        asyncio.to_thread(lambda: list(sparse_model.embed(chunks))),
+    )
 
-    # 4. Delete ALL existing chunks for this article before upserting new ones.
-    #    This prevents stale chunks from remaining when the article shrinks.
-    try:
-        await qdrant.delete(
-            collection_name=settings.qdrant_collection,
-            points_selector=models.FilterSelector(
-                filter=models.Filter(
-                    must=[
-                        models.FieldCondition(
-                            key="title",
-                            match=models.MatchValue(value=title),
-                        ),
-                    ]
-                )
-            ),
-        )
-        logger.debug("Deleted existing chunks for '%s' before re-ingestion.", title)
-    except Exception as exc:
-        logger.warning("Failed to delete old chunks for '%s': %s (proceeding with upsert)", title, exc)
-
-    # 5. Build points with deterministic IDs
+    # 4. Build points with deterministic IDs
     from datetime import datetime, timezone
+
     ingested_at = datetime.now(timezone.utc).isoformat()
 
     qdrant_points = []
     for i, chunk_text in enumerate(chunks):
         point_id = generate_point_id(title, i)
         sparse_obj = sparse_embeddings[i]
-        
+
         qdrant_points.append(
             models.PointStruct(
                 id=point_id,
@@ -149,7 +214,7 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
                     "sparse": models.SparseVector(
                         indices=sparse_obj.indices.tolist(),
                         values=sparse_obj.values.tolist(),
-                    )
+                    ),
                 },
                 payload={
                     "title": title,
@@ -159,24 +224,26 @@ async def process_event(event_data: Dict[str, Any], session: aiohttp.ClientSessi
                     "revision_id": revision_id,
                     "revision_source": "live",
                     "ingested_at": ingested_at,
-                }
+                },
             )
         )
 
-    await qdrant.upsert(
-        collection_name=settings.qdrant_collection,
-        points=qdrant_points
-    )
+    await qdrant.upsert(collection_name=settings.qdrant_collection, points=qdrant_points)
+
+    # 5. Remove surplus/legacy chunks only after the new content is stored.
+    keep_ids = {str(point.id) for point in qdrant_points}
+    await _remove_stale_article_chunks(qdrant, settings.qdrant_collection, title, keep_ids)
     logger.debug("Upserted %d chunks for '%s' (revision %s)", len(chunks), title, revision_id)
 
-    # 6. Update article-level index so Stage 1 discovery stays fresh (P1-4)
-    try:
-        from backend.article_index import upsert_article
-        summary_text = f"{title}. {chunks[0][:500]}" if chunks else title
-        await upsert_article(title, summary_text, uri)
-        logger.debug("Updated article index for '%s'", title)
-    except Exception as exc:
-        logger.warning("Failed to update article index for '%s': %s", title, exc)
+    # 6. Update derived indexes and invalidate answer caches. Failures are
+    # propagated so the event is retried through the DLQ.
+    from backend.article_index import extract_article_summary, upsert_article
+
+    await upsert_article(title, extract_article_summary(title, text), uri)
+    from backend.cache import bump_cache_generation
+
+    await bump_cache_generation()
+    logger.debug("Updated article index and invalidated caches for '%s'", title)
 
 
 async def listen_to_stream():
@@ -190,9 +257,10 @@ async def listen_to_stream():
     """
     settings = get_settings()
     stream_url = settings.wiki_stream_url
-    
+
     # Initialize Qdrant collection if it doesn't exist
     from backend.qdrant_client import init_collection
+
     # Run sync init_collection in thread
     await asyncio.to_thread(init_collection)
 
@@ -206,37 +274,44 @@ async def listen_to_stream():
 
     signal.signal(signal.SIGTERM, _handle_shutdown)
     signal.signal(signal.SIGINT, _handle_shutdown)
-    
+
     retry_count = 0
     events_since_dlq_retry = 0
-    
+
     while not shutdown_event.is_set():
         try:
             logger.info("Connecting to Wikimedia EventStreams...")
-            headers = {"User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"}
+            headers = {
+                "User-Agent": "WikiMindBot/1.0 (https://github.com/JayacharanR/End-to-End-Hybrid-RAG-Pipeline)"
+            }
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(stream_url, headers={"Accept": "text/event-stream"}) as response:
+                async with session.get(
+                    stream_url, headers={"Accept": "text/event-stream"}
+                ) as response:
                     if response.status != 200:
                         logger.error("Failed to connect: HTTP %d", response.status)
                         raise Exception(f"Connection failed: HTTP {response.status}")
-                        
+
                     retry_count = 0  # reset on successful connection
                     logger.info("Connected successfully. Listening for events...")
-                    
+
                     async for line in response.content:
                         if shutdown_event.is_set():
                             break
 
-                        line = line.decode('utf-8').strip()
+                        line = line.decode("utf-8").strip()
                         if line.startswith("data: "):
                             data_str = line[6:]
                             try:
                                 event = json.loads(data_str)
-                                # Filter: English Wikipedia, namespace 0 (Main articles), type 'edit'
-                                if (event.get("server_name") == "en.wikipedia.org" and
-                                    event.get("namespace") == 0 and
-                                    event.get("type") == "edit"):
-                                    
+                                # Filter: English Wikipedia, namespace 0 (Main
+                                # articles), including edits, new pages, and
+                                # deletions so latest-state semantics hold.
+                                if (
+                                    event.get("server_name") == "en.wikipedia.org"
+                                    and event.get("namespace") == 0
+                                    and event.get("type") in {"edit", "new", "delete"}
+                                ):
                                     # Process event with DLQ error handling
                                     try:
                                         await process_event(event, session)
@@ -245,9 +320,7 @@ async def listen_to_stream():
                                         )
                                         events_since_dlq_retry += 1
                                     except Exception as e:
-                                        updater_health.add_to_dlq(
-                                            event=event, error_msg=str(e)
-                                        )
+                                        updater_health.add_to_dlq(event=event, error_msg=str(e))
 
                                     # Periodic DLQ retry
                                     if events_since_dlq_retry >= DLQ_RETRY_INTERVAL:
@@ -261,18 +334,20 @@ async def listen_to_stream():
                                                 process_fn=process_event,
                                                 session=session,
                                             )
-                                    
+
                             except json.JSONDecodeError:
                                 continue
-                                
+
         except Exception as e:
             retry_count += 1
             # Capped exponential backoff (never exits fatally)
-            sleep_time = min(BASE_BACKOFF ** retry_count, MAX_BACKOFF)
+            sleep_time = min(BASE_BACKOFF**retry_count, MAX_BACKOFF)
             updater_health.record_failure(error=str(e))
             logger.warning(
                 "Stream disconnected (attempt %d). Retrying in %.1fs... (%s)",
-                retry_count, sleep_time, e,
+                retry_count,
+                sleep_time,
+                e,
             )
             await asyncio.sleep(sleep_time)
 

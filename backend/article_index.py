@@ -14,10 +14,10 @@ This replaces the previous Tavily-based article discovery, making the entire
 pipeline fully offline with no external API dependencies for retrieval.
 """
 
+import asyncio
 import hashlib
 import logging
 import uuid
-import asyncio
 from typing import List, Optional
 
 from qdrant_client.http import models
@@ -29,9 +29,14 @@ from data_pipeline.ingest import get_dense_model
 logger = logging.getLogger(__name__)
 
 
+class ArticleIndexUnavailable(RuntimeError):
+    """Raised when the article-level index cannot be queried."""
+
+
 # ---------------------------------------------------------------------------
 # Article Collection Management
 # ---------------------------------------------------------------------------
+
 
 def init_article_collection() -> None:
     """Initialize the article-level Qdrant collection.
@@ -85,6 +90,7 @@ def init_article_collection() -> None:
 # Article Search
 # ---------------------------------------------------------------------------
 
+
 async def search_articles(query: str, top_k: Optional[int] = None) -> List[str]:
     """Search the article-level index to identify relevant Wikipedia articles.
 
@@ -99,14 +105,14 @@ async def search_articles(query: str, top_k: Optional[int] = None) -> List[str]:
     Returns:
         List of Wikipedia article titles, ordered by relevance.
     """
-    settings = get_settings()
-    effective_top_k = top_k or settings.article_search_top_k
-    dense_model = get_dense_model()
-
-    # Generate query embedding
-    query_vector = list(dense_model.embed([query]))[0].tolist()
-
     try:
+        settings = get_settings()
+        effective_top_k = top_k or settings.article_search_top_k
+        dense_model = get_dense_model()
+
+        # Generate query embedding
+        query_vector = list(dense_model.embed([query]))[0].tolist()
+
         qdrant_async = get_async_qdrant()
         if qdrant_async is not None:
             results = await qdrant_async.query_points(
@@ -141,12 +147,13 @@ async def search_articles(query: str, top_k: Optional[int] = None) -> List[str]:
 
     except Exception as exc:
         logger.error("Article index search failed: %s", exc)
-        return []
+        raise ArticleIndexUnavailable("article-level retrieval is unavailable") from exc
 
 
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
 
 def generate_article_id(title: str) -> str:
     """Generate a deterministic UUID for an article-level entry.
@@ -200,8 +207,8 @@ async def upsert_article(title: str, summary_text: str, url: str = "") -> None:
     dense_model = get_dense_model()
     article_id = generate_article_id(title)
 
-    # Generate embedding
-    embedding = list(dense_model.embed([summary_text]))[0].tolist()
+    # Generate embeddings off the event loop because FastEmbed is synchronous
+    embedding = await asyncio.to_thread(lambda: list(dense_model.embed([summary_text]))[0].tolist())
 
     point = models.PointStruct(
         id=article_id,
@@ -227,3 +234,23 @@ async def upsert_article(title: str, summary_text: str, url: str = "") -> None:
             points=[point],
         )
     logger.debug("Upserted article index entry for '%s'", title)
+
+
+async def delete_article(title: str) -> None:
+    """Remove an article from the article-level discovery index."""
+    settings = get_settings()
+    qdrant = get_async_qdrant()
+    await qdrant.delete(
+        collection_name=settings.article_collection,
+        points_selector=models.FilterSelector(
+            filter=models.Filter(
+                must=[
+                    models.FieldCondition(
+                        key="title",
+                        match=models.MatchValue(value=title),
+                    )
+                ]
+            )
+        ),
+    )
+    logger.debug("Deleted article index entry for '%s'", title)

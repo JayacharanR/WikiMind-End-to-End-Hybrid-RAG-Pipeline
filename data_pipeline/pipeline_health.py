@@ -22,10 +22,10 @@ Usage::
 import json
 import logging
 import os
-import time
+import threading
 from collections import deque
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +57,7 @@ class PipelineHealthTracker:
         self.last_heartbeat: Optional[str] = None
         self.last_error: Optional[str] = None
         self.dlq: deque = deque(maxlen=_MAX_DLQ_SIZE)
+        self._dlq_lock = threading.RLock()
 
         # DLQ persistence
         if dlq_persist_path:
@@ -92,9 +93,15 @@ class PipelineHealthTracker:
 
         # Alert on consecutive failures
         if self.consecutive_failures >= 5:
-            self.alert("WARNING", f"[{self.name}] {self.consecutive_failures} consecutive failures. Last error: {error}")
+            self.alert(
+                "WARNING",
+                f"[{self.name}] {self.consecutive_failures} consecutive failures. Last error: {error}",
+            )
         if self.consecutive_failures >= 20:
-            self.alert("CRITICAL", f"[{self.name}] {self.consecutive_failures} consecutive failures — possible systemic issue")
+            self.alert(
+                "CRITICAL",
+                f"[{self.name}] {self.consecutive_failures} consecutive failures — possible systemic issue",
+            )
 
     # ------------------------------------------------------------------
     # Dead Letter Queue
@@ -121,8 +128,10 @@ class PipelineHealthTracker:
         )
         logger.warning(
             "[%s] Event added to DLQ (size=%d): %s — %s",
-            self.name, len(self.dlq),
-            event.get("title", "unknown")[:60], error_msg[:100],
+            self.name,
+            len(self.dlq),
+            event.get("title", "unknown")[:60],
+            error_msg[:100],
         )
 
         # Persist to disk after every addition
@@ -165,7 +174,9 @@ class PipelineHealthTracker:
                 self.events_processed += 1
                 logger.info(
                     "[%s] DLQ retry succeeded: %s (attempt %d)",
-                    self.name, entry["event"].get("title", "unknown"), entry["retries"],
+                    self.name,
+                    entry["event"].get("title", "unknown"),
+                    entry["retries"],
                 )
             except Exception as exc:
                 if entry["retries"] >= max_retries:
@@ -186,8 +197,11 @@ class PipelineHealthTracker:
         if stats["retried"] > 0:
             logger.info(
                 "[%s] DLQ retry summary: %d retried, %d succeeded, %d permanently failed, %d remaining",
-                self.name, stats["retried"], stats["succeeded"],
-                stats["permanently_failed"], len(self.dlq),
+                self.name,
+                stats["retried"],
+                stats["succeeded"],
+                stats["permanently_failed"],
+                len(self.dlq),
             )
 
         return stats
@@ -280,9 +294,12 @@ class PipelineHealthTracker:
     def _save_dlq(self) -> None:
         """Persist the DLQ to a JSON file on disk."""
         try:
-            data = list(self.dlq)
-            with open(self._dlq_path, "w") as f:
-                json.dump(data, f, indent=2, default=str)
+            with self._dlq_lock:
+                data = list(self.dlq)
+                temp_path = f"{self._dlq_path}.tmp"
+                with open(temp_path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2, default=str)
+                os.replace(temp_path, self._dlq_path)
         except Exception as exc:
             logger.debug("Failed to persist DLQ for %s: %s", self.name, exc)
 
@@ -299,7 +316,8 @@ class PipelineHealthTracker:
                 if self.dlq:
                     logger.info(
                         "[%s] Loaded %d DLQ items from disk.",
-                        self.name, len(self.dlq),
+                        self.name,
+                        len(self.dlq),
                     )
         except Exception as exc:
             logger.warning("Failed to load persisted DLQ for %s: %s", self.name, exc)

@@ -7,12 +7,12 @@ responses. All schemas use Pydantic V2 model conventions.
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, Field, field_validator
 
 # ---------------------------------------------------------------------------
 # Request Schemas
 # ---------------------------------------------------------------------------
+
 
 class QueryStrategies(BaseModel):
     """User-configurable retrieval strategy toggles.
@@ -61,6 +61,15 @@ class ChatRequest(BaseModel):
         description="Optional retrieval strategy toggles.",
     )
 
+    @field_validator("query")
+    @classmethod
+    def query_must_contain_text(cls, value: str) -> str:
+        """Reject whitespace-only queries while preserving user wording."""
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("query must contain non-whitespace text")
+        return normalized
+
 
 class CompareRequest(BaseModel):
     """Request body for the ``POST /chat/compare`` endpoint.
@@ -82,10 +91,19 @@ class CompareRequest(BaseModel):
         description="List of strategy config dicts, each with a 'name' key and strategy booleans. Max 5.",
     )
 
+    @field_validator("query")
+    @classmethod
+    def query_must_contain_text(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("query must contain non-whitespace text")
+        return normalized
+
 
 # ---------------------------------------------------------------------------
 # Response Schemas
 # ---------------------------------------------------------------------------
+
 
 class SourceDocument(BaseModel):
     """A single retrieved source document included in the response."""
@@ -133,6 +151,15 @@ class RetrievalMetadata(BaseModel):
     hallucination_retries: int = Field(
         default=0,
         description="Number of hallucination check retries triggered.",
+    )
+
+    retrieval_status: str = Field(
+        default="unknown",
+        description="Retrieval outcome: ok, no_results, or unavailable.",
+    )
+    article_discovery_status: str = Field(
+        default="unknown",
+        description="Article discovery outcome: ok, no_match, or unavailable.",
     )
 
 

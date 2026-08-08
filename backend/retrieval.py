@@ -8,16 +8,15 @@ identified by the web-search discovery step.
 
 import asyncio
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import unquote, urlparse
 
+from flashrank import Ranker, RerankRequest
 from qdrant_client.http import models
 
 from backend.config import get_settings
 from backend.qdrant_client import get_async_qdrant, get_sync_qdrant
 from data_pipeline.ingest import get_dense_model, get_sparse_model
-
-from flashrank import Ranker, RerankRequest
 
 logger = logging.getLogger(__name__)
 
@@ -41,6 +40,7 @@ def get_reranker() -> Ranker:
 # ---------------------------------------------------------------------------
 # Article Title Extraction
 # ---------------------------------------------------------------------------
+
 
 def extract_title_from_wikipedia_url(url: str) -> Optional[str]:
     """Extract the article title from a Wikipedia URL.
@@ -77,6 +77,7 @@ def extract_title_from_wikipedia_url(url: str) -> Optional[str]:
 # Hybrid Search with Optional Article Scoping
 # ---------------------------------------------------------------------------
 
+
 async def hybrid_search(
     query: str,
     article_titles: Optional[List[str]] = None,
@@ -106,8 +107,8 @@ async def hybrid_search(
     logger.debug("Generating dual embeddings for query: %s", query)
 
     # Generate embeddings (offloaded to thread to avoid blocking async loop)
-    dense_vector = (await asyncio.to_thread(lambda: list(dense_model.embed([query]))[0].tolist()))
-    sparse_obj = (await asyncio.to_thread(lambda: list(sparse_model.embed([query]))[0]))
+    dense_vector = await asyncio.to_thread(lambda: list(dense_model.embed([query]))[0].tolist())
+    sparse_obj = await asyncio.to_thread(lambda: list(sparse_model.embed([query]))[0])
     sparse_vector = models.SparseVector(
         indices=sparse_obj.indices.tolist(),
         values=sparse_obj.values.tolist(),
@@ -185,14 +186,16 @@ async def hybrid_search(
         # Format results
         documents = []
         for point in results.points:
-            documents.append({
-                "id": str(point.id),
-                "score": float(point.score),
-                "title": point.payload.get("title", ""),
-                "text": point.payload.get("page_content", ""),  # FlashRank expects "text" key
-                "url": point.payload.get("url", ""),
-                "chunk_index": point.payload.get("chunk_index", 0),
-            })
+            documents.append(
+                {
+                    "id": str(point.id),
+                    "score": float(point.score),
+                    "title": point.payload.get("title", ""),
+                    "text": point.payload.get("page_content", ""),  # FlashRank expects "text" key
+                    "url": point.payload.get("url", ""),
+                    "chunk_index": point.payload.get("chunk_index", 0),
+                }
+            )
 
         metadata["rrf_candidates"] = len(documents)
         logger.info("Hybrid search returned %d RRF candidates.", len(documents))
@@ -205,7 +208,7 @@ async def hybrid_search(
             reranked_results = ranker.rerank(rerank_request)
 
             # FlashRank returns the list sorted by score (descending)
-            top_documents = reranked_results[:settings.reranker_top_k]
+            top_documents = reranked_results[: settings.reranker_top_k]
 
             # Map "text" back to "content" for consistency
             for doc in top_documents:

@@ -5,8 +5,9 @@ with lifespan-managed resource initialization, CORS middleware, Prometheus
 metrics instrumentation, and cache-first query routing.
 """
 
+import asyncio
+import json
 import logging
-import os
 import time
 from collections import deque
 from contextlib import asynccontextmanager
@@ -16,11 +17,17 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+from sse_starlette.sse import EventSourceResponse
 
 from backend.cache import cache_lookup, cache_store, close_redis, get_redis_client
 from backend.config import get_settings
 from backend.llmops import get_langfuse_client, init_observability
-from backend.models import ChatRequest, ChatResponse, HealthResponse, RetrievalMetadata, ServiceStatus
+from backend.models import (
+    ChatRequest,
+    CompareRequest,
+    HealthResponse,
+    ServiceStatus,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,41 +36,80 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 _MAX_TRACES = 500
 _trace_log: deque = deque(maxlen=_MAX_TRACES)
+_rate_limit_windows: dict[str, deque] = {}
 
 
-def _record_trace(query: str, final_state: dict, latency_ms: float,
-                  cache_hit: bool = False, strategies: list = None) -> None:
+def _check_request_access(request: Request):
+    """Apply optional API-key authentication and a bounded local rate limit."""
+    settings = get_settings()
+    if settings.api_key:
+        supplied = request.headers.get("x-api-key", "")
+        if supplied != settings.api_key:
+            return JSONResponse(status_code=401, content={"detail": "Invalid API key"})
+
+    limit = max(0, settings.rate_limit_per_minute)
+    if limit == 0:
+        return None
+
+    now = time.monotonic()
+    client_host = request.client.host if request.client else "unknown"
+    window = _rate_limit_windows.setdefault(client_host, deque())
+    while window and now - window[0] >= 60:
+        window.popleft()
+    if len(window) >= limit:
+        return JSONResponse(
+            status_code=429,
+            content={"detail": "Rate limit exceeded"},
+            headers={"Retry-After": "60"},
+        )
+    window.append(now)
+    return None
+
+
+def _record_trace(
+    query: str,
+    final_state: dict,
+    latency_ms: float,
+    cache_hit: bool = False,
+    strategies: list = None,
+) -> None:
     """Record a query trace to the in-memory log for dashboard consumption."""
     import datetime
-    _trace_log.append({
-        "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
-        "query": query,
-        "generation": final_state.get("generation", "")[:300],
-        "latency_ms": round(latency_ms),
-        "steps": final_state.get("steps", 0),
-        "tokens": {
-            "prompt": 0,  # populated by Langfuse if available
-            "completion": 0,
-        },
-        "provenance_score": final_state.get("provenance_score", 0.0),
-        "attribution": final_state.get("attribution", "unknown"),
-        "guardrails_applied": final_state.get("guardrails_applied", False),
-        "retrieval_grade": final_state.get("retrieval_grade", ""),
-        "hallucination_grade": final_state.get("hallucination_grade", ""),
-        "answer_grade": final_state.get("answer_grade", ""),
-        "hallucination_retries": final_state.get("hallucination_retries", 0),
-        "answer_retries": final_state.get("answer_retries", 0),
-        "document_count": len(final_state.get("documents", [])),
-        "expanded_queries": final_state.get("expanded_queries", []),
-        "strategies": strategies or [],
-        "cache_hit": cache_hit,
-        "citation_map": final_state.get("citation_map", {}),
-    })
+
+    _trace_log.append(
+        {
+            "timestamp": datetime.datetime.utcnow().isoformat() + "Z",
+            "query": query,
+            "generation": final_state.get("generation", "")[:300],
+            "latency_ms": round(latency_ms),
+            "steps": final_state.get("steps", 0),
+            "tokens": {
+                "prompt": 0,  # populated by Langfuse if available
+                "completion": 0,
+            },
+            "provenance_score": final_state.get("provenance_score", 0.0),
+            "attribution": final_state.get("attribution", "unknown"),
+            "guardrails_applied": final_state.get("guardrails_applied", False),
+            "retrieval_grade": final_state.get("retrieval_grade", ""),
+            "hallucination_grade": final_state.get("hallucination_grade", ""),
+            "answer_grade": final_state.get("answer_grade", ""),
+            "hallucination_retries": final_state.get("hallucination_retries", 0),
+            "answer_retries": final_state.get("answer_retries", 0),
+            "document_count": len(final_state.get("documents", [])),
+            "retrieval_status": final_state.get("retrieval_status", "unknown"),
+            "article_discovery_status": final_state.get("article_discovery_status", "unknown"),
+            "expanded_queries": final_state.get("expanded_queries", []),
+            "strategies": strategies or [],
+            "cache_hit": cache_hit,
+            "citation_map": final_state.get("citation_map", {}),
+        }
+    )
 
 
 # ---------------------------------------------------------------------------
 # Application Lifespan
 # ---------------------------------------------------------------------------
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -74,7 +120,9 @@ async def lifespan(app: FastAPI):
     On shutdown: closes Redis connection and flushes any pending state.
     """
     settings = get_settings()
-    logging.basicConfig(level=settings.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s")
+    logging.basicConfig(
+        level=settings.log_level, format="%(asctime)s %(name)s %(levelname)s %(message)s"
+    )
 
     logger.info("WikiMind Backend starting up...")
     init_observability()
@@ -90,6 +138,7 @@ async def lifespan(app: FastAPI):
     # Pre-initialize Guardrails (non-fatal if unavailable)
     try:
         from backend.llmops import get_guardrails
+
         rails = get_guardrails()
         if rails:
             logger.info("NeMo Guardrails loaded successfully.")
@@ -97,11 +146,13 @@ async def lifespan(app: FastAPI):
             logger.info("NeMo Guardrails not available — running without safety rails.")
     except Exception as exc:
         logger.warning("Guardrails initialization failed (non-fatal): %s", exc)
-    
+
     # Initialize Qdrant collections (chunk-level + article-level)
-    from backend.qdrant_client import init_collection
-    from backend.article_index import init_article_collection
     import asyncio
+
+    from backend.article_index import init_article_collection
+    from backend.qdrant_client import init_collection
+
     await asyncio.to_thread(init_collection)
     await asyncio.to_thread(init_article_collection)
 
@@ -138,9 +189,9 @@ app = FastAPI(
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:8501",     # Streamlit default
+        "http://localhost:8501",  # Streamlit default
         "http://127.0.0.1:8501",
-        "http://localhost:8080",     # Dashboard
+        "http://localhost:8080",  # Dashboard
         "http://127.0.0.1:8080",
         "http://localhost:3000",
     ],
@@ -152,6 +203,7 @@ app.add_middleware(
 # Prometheus metrics instrumentation
 try:
     from prometheus_fastapi_instrumentator import Instrumentator
+
     Instrumentator().instrument(app).expose(app, include_in_schema=False)
     logger.info("Prometheus metrics instrumentation enabled.")
 except ImportError:
@@ -167,6 +219,7 @@ if _dashboard_dir.is_dir():
 # ---------------------------------------------------------------------------
 # Endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
@@ -191,26 +244,35 @@ async def health_check():
     settings = get_settings()
     if settings.qdrant_mode == "local":
         try:
-            from backend.qdrant_client import get_qdrant
+            from backend.qdrant_client import get_sync_qdrant
+
             start = time.monotonic()
-            client = get_qdrant()
-            cols = client.get_collections().collections
+            client = get_sync_qdrant()
+            collections = await asyncio.to_thread(client.get_collections)
+            cols = collections.collections
             latency = (time.monotonic() - start) * 1000
-            components.append(ServiceStatus(
-                name="qdrant", healthy=True, latency_ms=round(latency, 2),
-                detail=f"local, {len(cols)} collection(s)",
-            ))
+            components.append(
+                ServiceStatus(
+                    name="qdrant",
+                    healthy=True,
+                    latency_ms=round(latency, 2),
+                    detail=f"local, {len(cols)} collection(s)",
+                )
+            )
         except Exception as exc:
             components.append(ServiceStatus(name="qdrant", healthy=False, detail=str(exc)))
     else:
         try:
             import httpx
+
             start = time.monotonic()
             async with httpx.AsyncClient(timeout=5.0) as client:
                 resp = await client.get(f"{settings.qdrant_url}/healthz")
                 latency = (time.monotonic() - start) * 1000
                 healthy = resp.status_code == 200
-                components.append(ServiceStatus(name="qdrant", healthy=healthy, latency_ms=round(latency, 2)))
+                components.append(
+                    ServiceStatus(name="qdrant", healthy=healthy, latency_ms=round(latency, 2))
+                )
         except Exception as exc:
             components.append(ServiceStatus(name="qdrant", healthy=False, detail=str(exc)))
 
@@ -219,9 +281,11 @@ async def health_check():
     if langfuse is not None:
         try:
             start = time.monotonic()
-            auth_ok = langfuse.auth_check()
+            auth_ok = await asyncio.to_thread(langfuse.auth_check)
             latency = (time.monotonic() - start) * 1000
-            components.append(ServiceStatus(name="langfuse", healthy=auth_ok, latency_ms=round(latency, 2)))
+            components.append(
+                ServiceStatus(name="langfuse", healthy=auth_ok, latency_ms=round(latency, 2))
+            )
         except Exception as exc:
             components.append(ServiceStatus(name="langfuse", healthy=False, detail=str(exc)))
     else:
@@ -231,12 +295,8 @@ async def health_check():
     return HealthResponse(status=overall, components=components)
 
 
-import json
-import asyncio
-from sse_starlette.sse import EventSourceResponse
-
 @app.post("/chat")
-async def chat_endpoint(request: ChatRequest):
+async def chat_endpoint(http_request: Request, request: ChatRequest):
     """Primary RAG chat endpoint with cache-first routing.
 
     Checks the dual-layer cache (L1 exact-match, then L2 semantic) before
@@ -244,6 +304,10 @@ async def chat_endpoint(request: ChatRequest):
     Cache misses invoke the CRAG/Self-RAG state machine and stream the response
     via SSE.
     """
+    access_error = _check_request_access(http_request)
+    if access_error is not None:
+        return access_error
+
     query = request.query
 
     # Cache-first: check L1 and L2 before running the agent
@@ -259,28 +323,40 @@ async def chat_endpoint(request: ChatRequest):
         # Record trace for cache hits so dashboard metrics are accurate
         _record_trace(
             query=query,
-            final_state={"generation": cached_response.get("answer", "")},
+            final_state={
+                "generation": cached_response.get("answer", ""),
+                **cached_response.get("metadata", {}),
+            },
             latency_ms=0,
             cache_hit=True,
-            strategies=[],
+            strategies=[k for k, v in strategy_flags.items() if v],
         )
-        return JSONResponse(content={
-            "answer": cached_response.get("answer", ""),
-            "sources": cached_response.get("sources", []),
-            "metadata": {
-                "cache_hit": True,
-                "cache_level": cache_level,
-                "strategies_used": [],
-                "agent_steps": 0,
-            },
-        })
+        return JSONResponse(
+            content={
+                "answer": cached_response.get("answer", ""),
+                "sources": cached_response.get("sources", []),
+                "metadata": {
+                    "cache_hit": True,
+                    "cache_level": cache_level,
+                    "strategies_used": [k for k, v in strategy_flags.items() if v],
+                    "retrieval_status": cached_response.get("metadata", {}).get(
+                        "retrieval_status", "unknown"
+                    ),
+                    "article_discovery_status": cached_response.get("metadata", {}).get(
+                        "article_discovery_status", "unknown"
+                    ),
+                    "agent_steps": 0,
+                },
+            }
+        )
 
     # Cache miss: Stream from LangGraph
     async def sse_generator():
-        from backend.agent import agent_app, AgentState
+        from backend.agent import AgentState, agent_app
         from backend.llmops import get_langfuse_handler
+
         _sse_start_time = time.time()
-        
+
         initial_state: AgentState = {
             "query": query,
             "expanded_queries": [],
@@ -296,63 +372,72 @@ async def chat_endpoint(request: ChatRequest):
             "hallucination_retries": 0,
             "answer_retries": 0,
             "article_discovery_failed": False,
+            "article_discovery_status": "unknown",
+            "retrieval_status": "unknown",
             "citation_map": {},
             "provenance_score": 0.0,
             "attribution": "unknown",
             "guardrails_applied": False,
         }
-        
+
         # Setup Langfuse callbacks for per-query tracing
         config = {}
         handler = get_langfuse_handler(
             trace_name="wikimind_query",
             session_id=f"session_{int(time.time())}",
-            metadata={"query": query[:100], "strategies": list(
-                k for k, v in request.strategies.model_dump().items() if v
-            )},
+            metadata={
+                "query": query[:100],
+                "strategies": list(k for k, v in request.strategies.model_dump().items() if v),
+            },
         )
         if handler:
             config = {"callbacks": [handler]}
-            
+
         logger.info("Invoking LangGraph agent pipeline for: %s", query[:60])
-        
+
         try:
             current_state = dict(initial_state)
+
             # Stream the state updates from LangGraph
-            async for output in agent_app.astream(initial_state, config=config, stream_mode="updates"):
+            async def bounded_state_stream():
+                async with asyncio.timeout(get_settings().request_timeout_seconds):
+                    async for output in agent_app.astream(
+                        initial_state, config=config, stream_mode="updates"
+                    ):
+                        yield output
+
+            async for output in bounded_state_stream():
                 # output is a dict keyed by the node name
                 for node_name, state_update in output.items():
                     current_state.update(state_update)
                     event_data = {
                         "node": node_name,
                         "steps": current_state.get("steps", 0),
-                        "status": f"Completed node: {node_name}"
+                        "status": f"Completed node: {node_name}",
                     }
-                    
+
                     if node_name == "retrieve":
                         docs = current_state.get("documents", [])
                         event_data["document_count"] = len(docs)
-                        
-                    yield {
-                        "event": "update",
-                        "data": json.dumps(event_data)
-                    }
-                    
+
+                    yield {"event": "update", "data": json.dumps(event_data)}
+
             # Once graph completes, yield the final answer and cache it
-            if 'generation' in current_state:
-                answer = current_state['generation']
-                sources = current_state.get('documents', [])
-                
+            if "generation" in current_state:
+                answer = current_state["generation"]
+                sources = current_state.get("documents", [])
+
                 # Format sources for response
                 formatted_sources = [
                     {
                         "title": d.get("title", ""),
                         "content": d.get("content", ""),
                         "score": float(d.get("score", 0.0)),
-                        "url": d.get("url")
-                    } for d in sources
+                        "url": d.get("url"),
+                    }
+                    for d in sources
                 ]
-                
+
                 final_response = {
                     "answer": answer,
                     "sources": formatted_sources,
@@ -366,59 +451,65 @@ async def chat_endpoint(request: ChatRequest):
                         "provenance_score": current_state.get("provenance_score", 0.0),
                         "attribution": current_state.get("attribution", "unknown"),
                         "guardrails_applied": current_state.get("guardrails_applied", False),
+                        "retrieval_status": current_state.get("retrieval_status", "unknown"),
+                        "article_discovery_status": current_state.get(
+                            "article_discovery_status", "unknown"
+                        ),
                     },
                     "citation_map": current_state.get("citation_map", {}),
                 }
-                
+
                 # Write to cache — but skip abstention/error responses
                 attribution = current_state.get("attribution", "unknown")
                 answer_text = final_response.get("answer", "")
                 is_cacheable = (
-                    attribution != "abstention"
+                    attribution not in {"abstention", "retrieval_unavailable"}
                     and "Error generating response" not in answer_text
                 )
                 if is_cacheable:
-                    asyncio.create_task(cache_store(query, final_response, strategies=strategy_flags))
-                
+                    asyncio.create_task(
+                        cache_store(query, final_response, strategies=strategy_flags)
+                    )
+
                 # Record trace for dashboard
                 trace_latency = (time.time() - _sse_start_time) * 1000
                 _record_trace(
                     query=query,
                     final_state=current_state,
                     latency_ms=trace_latency,
-                    strategies=list(
-                        k for k, v in request.strategies.model_dump().items() if v
-                    ),
+                    strategies=list(k for k, v in request.strategies.model_dump().items() if v),
                 )
-                
-                yield {
-                    "event": "final",
-                    "data": json.dumps(final_response)
-                }
-                
+
+                yield {"event": "final", "data": json.dumps(final_response)}
+
         except Exception as exc:
             import uuid as _uuid
+
             error_id = str(_uuid.uuid4())[:8]
             logger.error("Error during LangGraph streaming [%s]: %s", error_id, exc)
             yield {
                 "event": "error",
-                "data": json.dumps({"detail": f"An internal error occurred. Reference: {error_id}"})
+                "data": json.dumps(
+                    {"detail": f"An internal error occurred. Reference: {error_id}"}
+                ),
             }
-            
+
     return EventSourceResponse(sse_generator())
 
 
 @app.post("/chat/compare")
-async def chat_compare(request: Request):
+async def chat_compare(request: Request, compare_req: CompareRequest):
     """Run a query through multiple strategy configurations for A/B comparison.
 
     Accepts a query and a list of named strategy configs, executes the pipeline
     sequentially for each, and returns all results in a single response.
     """
-    from backend.models import CompareRequest, QueryStrategies
+    access_error = _check_request_access(request)
+    if access_error is not None:
+        return access_error
 
-    body = await request.json()
-    compare_req = CompareRequest(**body)
+    from backend.llmops import get_langfuse_handler
+    from backend.models import QueryStrategies
 
     results = []
     for config in compare_req.configs:
@@ -429,6 +520,7 @@ async def chat_compare(request: Request):
             step_back=config.get("step_back", False),
             decomposition=config.get("decomposition", False),
             page_index=config.get("page_index", False),
+            knowledge_graph=config.get("knowledge_graph", False),
         )
 
         initial_state = {
@@ -449,10 +541,14 @@ async def chat_compare(request: Request):
             "provenance_score": 0.0,
             "attribution": "unknown",
             "guardrails_applied": False,
+            "article_discovery_failed": False,
+            "article_discovery_status": "unknown",
+            "retrieval_status": "unknown",
         }
 
-        from backend.agent import agent_app
         import time as time_mod
+
+        from backend.agent import agent_app
 
         # Langfuse trace per config
         handler = get_langfuse_handler(
@@ -464,7 +560,10 @@ async def chat_compare(request: Request):
 
         start = time_mod.monotonic()
         try:
-            final_state = await agent_app.ainvoke(initial_state, config=invoke_config)
+            final_state = await asyncio.wait_for(
+                agent_app.ainvoke(initial_state, config=invoke_config),
+                timeout=get_settings().request_timeout_seconds,
+            )
             latency = time_mod.monotonic() - start
 
             sources = [
@@ -477,28 +576,36 @@ async def chat_compare(request: Request):
                 for doc in final_state.get("documents", [])
             ]
 
-            results.append({
-                "config_name": config_name,
-                "answer": final_state.get("generation", ""),
-                "sources": sources,
-                "metadata": {
-                    "agent_steps": final_state.get("steps", 0),
-                    "hallucination_retries": final_state.get("hallucination_retries", 0),
-                    "retrieval_grade": final_state.get("retrieval_grade", ""),
-                    "answer_grade": final_state.get("answer_grade", ""),
-                },
-                "latency": round(latency, 3),
-            })
+            results.append(
+                {
+                    "config_name": config_name,
+                    "answer": final_state.get("generation", ""),
+                    "sources": sources,
+                    "metadata": {
+                        "agent_steps": final_state.get("steps", 0),
+                        "hallucination_retries": final_state.get("hallucination_retries", 0),
+                        "retrieval_grade": final_state.get("retrieval_grade", ""),
+                        "answer_grade": final_state.get("answer_grade", ""),
+                        "retrieval_status": final_state.get("retrieval_status", "unknown"),
+                        "article_discovery_status": final_state.get(
+                            "article_discovery_status", "unknown"
+                        ),
+                    },
+                    "latency": round(latency, 3),
+                }
+            )
         except Exception as exc:
             latency = time_mod.monotonic() - start
-            results.append({
-                "config_name": config_name,
-                "answer": f"Error: {exc}",
-                "sources": [],
-                "metadata": {},
-                "latency": round(latency, 3),
-                "error": str(exc),
-            })
+            results.append(
+                {
+                    "config_name": config_name,
+                    "answer": f"Error: {exc}",
+                    "sources": [],
+                    "metadata": {},
+                    "latency": round(latency, 3),
+                    "error": str(exc),
+                }
+            )
 
     return {"query": compare_req.query, "results": results}
 
@@ -506,6 +613,7 @@ async def chat_compare(request: Request):
 # ---------------------------------------------------------------------------
 # Dashboard API Endpoints
 # ---------------------------------------------------------------------------
+
 
 @app.get("/api/metrics")
 async def api_metrics():
@@ -594,6 +702,7 @@ async def api_eval_results():
         return {"results": []}
 
     import json as json_mod
+
     results = []
     for f in sorted(results_dir.glob("*.json"), reverse=True):
         try:
@@ -631,12 +740,14 @@ async def api_pipeline_health():
 
     try:
         from data_pipeline.wiki_updater import get_updater_health
+
         workers.append(get_updater_health())
     except Exception as exc:
         workers.append({"worker": "wiki-updater", "status": "unavailable", "error": str(exc)})
 
     try:
         from data_pipeline.reconciler import get_reconciler_health
+
         workers.append(get_reconciler_health())
     except Exception as exc:
         workers.append({"worker": "reconciler", "status": "unavailable", "error": str(exc)})
@@ -648,4 +759,3 @@ async def api_pipeline_health():
             break
 
     return {"status": overall, "workers": workers}
-

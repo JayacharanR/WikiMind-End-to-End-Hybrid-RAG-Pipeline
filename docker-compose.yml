@@ -109,7 +109,7 @@ services:
           memory: 1G
 
   qdrant:
-    image: qdrant/qdrant:latest
+    image: ${QDRANT_IMAGE:-qdrant/qdrant:v1.14.1}
     container_name: wikimind-qdrant
     ports:
       - "6333:6333"
@@ -129,7 +129,7 @@ services:
           memory: 4G
 
   redis:
-    image: redis/redis-stack-server:latest
+    image: ${REDIS_IMAGE:-redis/redis-stack-server:7.4.0-v2}
     container_name: wikimind-redis
     ports:
       - "6379:6379"
@@ -152,7 +152,7 @@ services:
   # -------------------------------------------------------------------------
 
   langfuse:
-    image: langfuse/langfuse:2
+    image: ${LANGFUSE_IMAGE:-langfuse/langfuse:2.95.2}
     container_name: wikimind-langfuse
     ports:
       - "3000:3000"
@@ -187,7 +187,7 @@ services:
           memory: 1G
 
   langfuse-db:
-    image: postgres:15-alpine
+    image: ${POSTGRES_IMAGE:-postgres:15.8-alpine}
     container_name: wikimind-langfuse-db
     environment:
       - POSTGRES_USER=langfuse

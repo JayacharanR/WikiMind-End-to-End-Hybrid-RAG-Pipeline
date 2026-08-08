@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 # Langfuse Observability
 # ---------------------------------------------------------------------------
 
+
 def _create_langfuse_client() -> Optional[Langfuse]:
     """Create a Langfuse client instance if credentials are available.
 
@@ -30,6 +31,7 @@ def _create_langfuse_client() -> Optional[Langfuse]:
         Langfuse client if credentials are configured, None otherwise.
     """
     from backend.config import get_settings
+
     settings = get_settings()
 
     if not settings.langfuse_secret_key or not settings.langfuse_public_key:
@@ -90,9 +92,14 @@ def get_langfuse_handler(**kwargs) -> Optional[LangfuseCallbackHandler]:
         Optional[LangfuseCallbackHandler]: Handler or None.
     """
     from backend.config import get_settings
+
     settings = get_settings()
 
-    if not settings.langfuse_secret_key or not settings.langfuse_public_key or "placeholder" in settings.langfuse_secret_key:
+    if (
+        not settings.langfuse_secret_key
+        or not settings.langfuse_public_key
+        or "placeholder" in settings.langfuse_secret_key
+    ):
         return None
 
     try:
@@ -140,6 +147,7 @@ def push_eval_scores(
 # NeMo Guardrails
 # ---------------------------------------------------------------------------
 
+
 @lru_cache
 def get_guardrails() -> Optional[LLMRails]:
     """Initialize and cache the NeMo Guardrails application.
@@ -153,8 +161,10 @@ def get_guardrails() -> Optional[LLMRails]:
     """
     try:
         import os
+
         config_path = os.path.join(os.path.dirname(__file__), "guardrails_config")
         from backend.agent import _get_llm
+
         config = RailsConfig.from_path(config_path)
         rails = LLMRails(config, llm=_get_llm())
         logger.info("NeMo Guardrails initialized from %s", config_path)

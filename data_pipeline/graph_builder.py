@@ -69,11 +69,13 @@ def _scroll_all_chunks(limit: int = 0) -> List[Dict[str, Any]]:
 
         for point in points:
             payload = point.payload or {}
-            chunks.append({
-                "title": payload.get("title", ""),
-                "page_content": payload.get("page_content", ""),
-                "chunk_index": payload.get("chunk_index", 0),
-            })
+            chunks.append(
+                {
+                    "title": payload.get("title", ""),
+                    "page_content": payload.get("page_content", ""),
+                    "chunk_index": payload.get("chunk_index", 0),
+                }
+            )
             total += 1
 
             if limit > 0 and total >= limit:
@@ -148,7 +150,10 @@ def _build_graph_from_chunks(chunks: List[Dict[str, Any]]) -> nx.DiGraph:
         if (i + 1) % 500 == 0:
             logger.info(
                 "Processed %d/%d chunks | %d entities | %d edges",
-                i + 1, len(chunks), total_entities, total_edges,
+                i + 1,
+                len(chunks),
+                total_entities,
+                total_edges,
             )
 
     logger.info(
@@ -229,10 +234,12 @@ def main():
 
     args = parser.parse_args()
 
-    asyncio.run(build_knowledge_graph(
-        scroll_limit=args.scroll_limit,
-        incremental=not args.no_incremental,
-    ))
+    asyncio.run(
+        build_knowledge_graph(
+            scroll_limit=args.scroll_limit,
+            incremental=not args.no_incremental,
+        )
+    )
 
 
 if __name__ == "__main__":

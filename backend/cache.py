@@ -63,6 +63,7 @@ async def close_redis() -> None:
 # L1 Exact-Match Cache
 # ---------------------------------------------------------------------------
 
+
 def _normalize_query(query: str) -> str:
     """Normalize a query string for consistent cache key generation.
 
@@ -78,7 +79,43 @@ def _normalize_query(query: str) -> str:
     return query.strip().lower().rstrip("?.!")
 
 
-def _hash_query(query: str, strategies: dict = None) -> str:
+_CACHE_GENERATION_KEY = "wikimind:cache:knowledge_generation"
+
+
+def _strategy_scope(strategies: dict = None, generation: str = "0") -> str:
+    """Return a stable cache namespace for strategy flags and KB generation."""
+    active = sorted(k for k, value in (strategies or {}).items() if value)
+    strategy_name = ",".join(active) or "default"
+    return f"generation={generation};strategies={strategy_name}"
+
+
+async def get_cache_generation() -> str:
+    """Read the shared knowledge-base generation used to invalidate answers."""
+    try:
+        client = await get_redis_client()
+        generation = await client.get(_CACHE_GENERATION_KEY)
+        if generation is None:
+            await client.set(_CACHE_GENERATION_KEY, "0", nx=True)
+            return "0"
+        return str(generation)
+    except Exception as exc:
+        logger.warning("Cache generation lookup failed: %s", exc)
+        return "0"
+
+
+async def bump_cache_generation() -> str:
+    """Invalidate all answer-cache namespaces after a source update."""
+    try:
+        client = await get_redis_client()
+        generation = await client.incr(_CACHE_GENERATION_KEY)
+        logger.info("Advanced knowledge-base cache generation to %s", generation)
+        return str(generation)
+    except Exception as exc:
+        logger.warning("Cache generation invalidation failed: %s", exc)
+        return "0"
+
+
+def _hash_query(query: str, strategies: dict = None, generation: str = "0") -> str:
     """Generate a SHA-256 hash key for a normalized query + strategies.
 
     Includes active strategies in the hash so the same query with different
@@ -92,10 +129,7 @@ def _hash_query(query: str, strategies: dict = None) -> str:
         Hex-encoded SHA-256 hash prefixed with ``wikimind:cache:l1:``.
     """
     normalized = _normalize_query(query)
-    # Include sorted active strategy names in the hash
-    if strategies:
-        active = sorted(k for k, v in strategies.items() if v)
-        normalized += "|" + ",".join(active)
+    normalized += "|" + _strategy_scope(strategies, generation)
     digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()
     return f"wikimind:cache:l1:{digest}"
 
@@ -110,9 +144,9 @@ async def l1_get(query: str, strategies: dict = None) -> Optional[dict]:
     Returns:
         Cached response dict if found, None otherwise.
     """
-    key = _hash_query(query, strategies)
-
     try:
+        generation = await get_cache_generation()
+        key = _hash_query(query, strategies, generation)
         client = await get_redis_client()
         cached = await client.get(key)
         if cached is not None:
@@ -124,7 +158,9 @@ async def l1_get(query: str, strategies: dict = None) -> Optional[dict]:
     return None
 
 
-async def l1_set(query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None) -> None:
+async def l1_set(
+    query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None
+) -> None:
     """Store a response in the L1 exact-match cache.
 
     Args:
@@ -135,8 +171,9 @@ async def l1_set(query: str, response: dict, ttl: Optional[int] = None, strategi
     """
     try:
         settings = get_settings()
+        generation = await get_cache_generation()
         client = await get_redis_client()
-        key = _hash_query(query, strategies)
+        key = _hash_query(query, strategies, generation)
         effective_ttl = ttl or settings.cache_ttl_static
         await client.setex(key, effective_ttl, json.dumps(response))
         logger.debug("L1 cache SET for query hash %s (TTL=%ds)", key[-12:], effective_ttl)
@@ -151,7 +188,7 @@ async def l1_set(query: str, response: dict, ttl: Optional[int] = None, strategi
 # Strategy 2 (Fallback): Pure-Redis with FastEmbed embeddings + brute-force cosine
 # Strategy 3 (Degraded): L2 disabled entirely (standard logging)
 
-_semantic_cache = None
+_semantic_caches = {}
 _l2_strategy: Optional[str] = None  # "redisvl", "pure_redis", or None
 _l2_embed_model = None
 
@@ -163,7 +200,8 @@ _L2_MAX_POOL_SIZE = 500
 def _cosine_similarity(a: list, b: list) -> float:
     """Compute cosine similarity between two vectors."""
     import math
-    dot = sum(x * y for x, y in zip(a, b))
+
+    dot = sum(x * y for x, y in zip(a, b, strict=False))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(x * x for x in b))
     if norm_a == 0 or norm_b == 0:
@@ -177,6 +215,7 @@ def _get_l2_embed_model():
     if _l2_embed_model is None:
         try:
             from fastembed import TextEmbedding
+
             settings = get_settings()
             _l2_embed_model = TextEmbedding(model_name=settings.embedding_model)
             logger.debug("L2 FastEmbed model loaded: %s", settings.embedding_model)
@@ -187,7 +226,7 @@ def _get_l2_embed_model():
 
 async def _init_l2_strategy():
     """Determine and initialize the best available L2 strategy."""
-    global _semantic_cache, _l2_strategy
+    global _l2_strategy
 
     if _l2_strategy is not None:
         return _l2_strategy
@@ -195,9 +234,10 @@ async def _init_l2_strategy():
     # Strategy 1: Try RedisVL (requires Redis Stack with RediSearch)
     try:
         from redisvl.extensions.llmcache import SemanticCache
+
         settings = get_settings()
-        _semantic_cache = SemanticCache(
-            name="wikimind_l2_cache",
+        _semantic_caches[_strategy_scope()] = SemanticCache(
+            name="wikimind_l2_cache_default",
             redis_url=settings.redis_url,
             distance_threshold=1.0 - settings.cache_similarity_threshold,
         )
@@ -230,7 +270,25 @@ async def _init_l2_strategy():
     return _l2_strategy
 
 
-async def l2_get(query: str) -> Optional[dict]:
+def _get_redisvl_cache(scope: str):
+    """Return a RedisVL cache isolated to one strategy/generation scope."""
+    if scope in _semantic_caches:
+        return _semantic_caches[scope]
+
+    from redisvl.extensions.llmcache import SemanticCache
+
+    settings = get_settings()
+    scope_hash = hashlib.sha256(scope.encode("utf-8")).hexdigest()[:16]
+    cache = SemanticCache(
+        name=f"wikimind_l2_cache_{scope_hash}",
+        redis_url=settings.redis_url,
+        distance_threshold=1.0 - settings.cache_similarity_threshold,
+    )
+    _semantic_caches[scope] = cache
+    return cache
+
+
+async def l2_get(query: str, strategies: dict = None) -> Optional[dict]:
     """Look up a semantically similar cached response.
 
     Tries RedisVL first (HNSW index), falls back to pure-Redis
@@ -249,7 +307,9 @@ async def l2_get(query: str) -> Optional[dict]:
 
     if strategy == "redisvl":
         try:
-            results = _semantic_cache.check(prompt=query)
+            scope = _strategy_scope(strategies, await get_cache_generation())
+            semantic_cache = _get_redisvl_cache(scope)
+            results = semantic_cache.check(prompt=query)
             if results:
                 best = results[0]
                 logger.info(
@@ -270,6 +330,8 @@ async def l2_get(query: str) -> Optional[dict]:
         if model is None:
             return None
 
+        generation = await get_cache_generation()
+        scope = _strategy_scope(strategies, generation)
         query_embedding = list(model.embed([query]))[0].tolist()
         client = await get_redis_client()
         settings = get_settings()
@@ -293,6 +355,8 @@ async def l2_get(query: str) -> Optional[dict]:
                 if data is None:
                     continue
                 entry = json.loads(data)
+                if entry.get("scope") != scope:
+                    continue
                 stored_embedding = entry.get("embedding", [])
                 similarity = _cosine_similarity(query_embedding, stored_embedding)
                 if similarity > best_score:
@@ -304,7 +368,8 @@ async def l2_get(query: str) -> Optional[dict]:
         if best_score >= threshold and best_response:
             logger.info(
                 "L2 cache HIT [pure_redis] (sim=%.4f) for: %s",
-                best_score, query[:60],
+                best_score,
+                query[:60],
             )
             return json.loads(best_response) if isinstance(best_response, str) else best_response
 
@@ -314,7 +379,12 @@ async def l2_get(query: str) -> Optional[dict]:
     return None
 
 
-async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
+async def l2_set(
+    query: str,
+    response: dict,
+    ttl: Optional[int] = None,
+    strategies: dict = None,
+) -> None:
     """Store a response in the L2 semantic cache.
 
     Uses RedisVL if available, otherwise falls back to pure-Redis
@@ -335,10 +405,12 @@ async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
 
     if strategy == "redisvl":
         try:
-            _semantic_cache.store(
+            scope = _strategy_scope(strategies, await get_cache_generation())
+            semantic_cache = _get_redisvl_cache(scope)
+            semantic_cache.store(
                 prompt=query,
                 response=json.dumps(response),
-                metadata={"ttl": effective_ttl},
+                metadata={"ttl": effective_ttl, "scope": scope},
             )
             logger.debug("L2 [redisvl] SET for: %s", query[:60])
         except Exception as exc:
@@ -351,16 +423,22 @@ async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
         if model is None:
             return
 
+        generation = await get_cache_generation()
+        scope = _strategy_scope(strategies, generation)
         query_embedding = list(model.embed([query]))[0].tolist()
         client = await get_redis_client()
 
         # Generate a unique key for this entry
-        entry_key = f"{_L2_POOL_PREFIX}:{hashlib.md5(query.encode()).hexdigest()}"
-        entry_data = json.dumps({
-            "embedding": query_embedding,
-            "response": json.dumps(response),
-            "query": query[:200],
-        })
+        entry_hash = hashlib.md5(f"{scope}|{query}".encode()).hexdigest()
+        entry_key = f"{_L2_POOL_PREFIX}:{entry_hash}"
+        entry_data = json.dumps(
+            {
+                "embedding": query_embedding,
+                "response": json.dumps(response),
+                "query": query[:200],
+                "scope": scope,
+            }
+        )
 
         await client.setex(entry_key, effective_ttl, entry_data)
 
@@ -390,6 +468,7 @@ async def l2_set(query: str, response: dict, ttl: Optional[int] = None) -> None:
 # Unified Cache Interface
 # ---------------------------------------------------------------------------
 
+
 async def cache_lookup(query: str, strategies: dict = None) -> tuple[Optional[dict], Optional[str]]:
     """Perform a tiered cache lookup (L1 first, then L2).
 
@@ -414,7 +493,7 @@ async def cache_lookup(query: str, strategies: dict = None) -> tuple[Optional[di
         return result, "l1"
 
     # L2: semantic similarity (strategy-blind — uses raw query only)
-    result = await l2_get(query)
+    result = await l2_get(query, strategies)
     if result is not None:
         elapsed = (time.monotonic() - start) * 1000
         logger.info("Cache resolved via L2 in %.1fms", elapsed)
@@ -425,7 +504,9 @@ async def cache_lookup(query: str, strategies: dict = None) -> tuple[Optional[di
     return None, None
 
 
-async def cache_store(query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None) -> None:
+async def cache_store(
+    query: str, response: dict, ttl: Optional[int] = None, strategies: dict = None
+) -> None:
     """Store a response in both L1 and L2 caches.
 
     Writing to both layers ensures that identical queries are served from
@@ -439,7 +520,7 @@ async def cache_store(query: str, response: dict, ttl: Optional[int] = None, str
         strategies: Optional strategy toggles for cache key partitioning.
     """
     await l1_set(query, response, ttl=ttl, strategies=strategies)
-    await l2_set(query, response, ttl=ttl)
+    await l2_set(query, response, ttl=ttl, strategies=strategies)
 
 
 async def cache_invalidate(query: str, strategies: dict = None) -> None:
@@ -452,10 +533,15 @@ async def cache_invalidate(query: str, strategies: dict = None) -> None:
         query: The query string whose cache entries should be invalidated.
         strategies: Optional strategy toggles for cache key partitioning.
     """
-    client = await get_redis_client()
-    key = _hash_query(query, strategies)
     try:
+        generation = await get_cache_generation()
+        client = await get_redis_client()
+        key = _hash_query(query, strategies, generation)
         await client.delete(key)
         logger.debug("L1 cache invalidated for query hash %s", key[-12:])
+        if _l2_strategy == "pure_redis":
+            scope = _strategy_scope(strategies, generation)
+            entry_hash = hashlib.md5(f"{scope}|{query}".encode()).hexdigest()
+            await client.delete(f"{_L2_POOL_PREFIX}:{entry_hash}")
     except Exception as exc:
         logger.warning("L1 cache invalidation failed: %s", exc)

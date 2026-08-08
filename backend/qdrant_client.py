@@ -61,6 +61,15 @@ class LocalAsyncQdrantAdapter:
     async def set_payload(self, **kwargs):
         return await asyncio.to_thread(self._sync.set_payload, **kwargs)
 
+    async def delete(self, **kwargs):
+        """Delete points through the embedded sync client.
+
+        The local adapter is used by the live updater and reconciler.  Keeping
+        deletion here is essential: without it, an article that shrinks after
+        an edit retains its old surplus chunks forever.
+        """
+        return await asyncio.to_thread(self._sync.delete, **kwargs)
+
     async def search(self, **kwargs):
         return await asyncio.to_thread(self._sync.search, **kwargs)
 
@@ -128,6 +137,7 @@ def get_sync_qdrant() -> QdrantClient:
 # Collection Schema
 # ---------------------------------------------------------------------------
 
+
 def init_collection() -> None:
     """Initialize the Qdrant collection with a hybrid vector schema.
 
@@ -147,7 +157,7 @@ def init_collection() -> None:
             return
 
         logger.info("Creating Qdrant collection '%s' with hybrid schema...", collection_name)
-        
+
         # Define hybrid schema with both dense and sparse vectors
         client.create_collection(
             collection_name=collection_name,
@@ -158,12 +168,10 @@ def init_collection() -> None:
                 )
             },
             sparse_vectors_config={
-                "sparse": models.SparseVectorParams(
-                    modifier=models.Modifier.IDF
-                )
-            }
+                "sparse": models.SparseVectorParams(modifier=models.Modifier.IDF)
+            },
         )
-        
+
         # Create a payload index on the 'title' field for faster exact-match filtering
         client.create_payload_index(
             collection_name=collection_name,
@@ -180,6 +188,7 @@ def init_collection() -> None:
 # ---------------------------------------------------------------------------
 # Utilities
 # ---------------------------------------------------------------------------
+
 
 def generate_point_id(article_title: str, chunk_index: int) -> str:
     """Generate a deterministic UUID for a chunk to prevent duplication.
