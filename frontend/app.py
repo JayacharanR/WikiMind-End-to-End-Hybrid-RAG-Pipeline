@@ -97,9 +97,35 @@ def inject_llama_css():
             display: none !important; /* Hide user avatar */
         }
         
-        /* Clean Headers */
+        /* Clean Headers & Maintain Sidebar Toggle Controls */
         [data-testid="stHeader"] {
+            background-color: transparent !important;
+            color: #E5E5E5 !important;
+        }
+        [data-testid="stDecoration"] {
             display: none !important;
+        }
+        [data-testid="stAppDeployButton"],
+        #MainMenu,
+        header [data-testid="stToolbarActions"],
+        [data-testid="stStatusWidget"] {
+            display: none !important;
+        }
+        
+        /* Ensure sidebar collapse & expand controls are clearly visible and styled */
+        [data-testid="collapsedControl"],
+        [data-testid="stSidebarCollapseButton"],
+        button[data-testid="stSidebarCollapseButton"] {
+            display: flex !important;
+            visibility: visible !important;
+            color: #E5E5E5 !important;
+            background-color: transparent !important;
+        }
+        [data-testid="collapsedControl"]:hover,
+        [data-testid="stSidebarCollapseButton"]:hover {
+            color: #FFFFFF !important;
+            background-color: rgba(255, 255, 255, 0.1) !important;
+            border-radius: 8px !important;
         }
         footer {
             display: none !important;
