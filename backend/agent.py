@@ -482,9 +482,13 @@ _CITATION_SYSTEM_PROMPT = (
     "CITATION RULES:\n"
     "- After each factual claim, add the source number in square brackets, "
     "e.g. 'Paris is the capital of France [1].'\n"
+    "- Every factual sentence MUST end with its source number in brackets, "
+    "e.g. 'Paris is the capital of France [1].'\n"
     "- You may cite multiple sources: 'The population is 14 million [1][3].'\n"
     "- If the context does not contain the answer, say exactly: "
-    "'I cannot answer this based on the retrieved context.'\n\n"
+    "'I cannot answer this based on the retrieved context.'\n"
+    "- Keep the answer direct and concise (1-3 sentences). Do not include meta-commentary, "
+    "conversational filler, or disclaimers.\n\n"
     "Context:\n{context}"
 )
 
@@ -566,11 +570,16 @@ async def node_generate(state: AgentState) -> Dict:
     # --- Try NeMo Guardrails first ---
     try:
         generation = await safe_generate(query=query, context=context)
-        if generation and "Error:" not in generation and "not initialized" not in generation:
+        if (
+            generation
+            and "Error:" not in generation
+            and "not initialized" not in generation
+            and not (generation.strip().startswith("{") and generation.strip().endswith("}"))
+        ):
             guardrails_applied = True
             logger.info("Generation via NeMo Guardrails succeeded.")
         else:
-            raise RuntimeError("Guardrails returned error or unavailable")
+            raise RuntimeError("Guardrails returned error, tool call, or unavailable")
     except Exception as exc:
         logger.info("Guardrails unavailable (%s). Falling back to direct LLM.", exc)
         generation = await _direct_llm_generate(query, context)

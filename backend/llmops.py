@@ -198,14 +198,16 @@ async def safe_generate(query: str, context: str = "") -> Optional[str]:
         logger.warning("Guardrails not available. Returning None for fallback.")
         return None
 
-    # Append strict formatting, anti-tool-call, and citation instructions
+    # Build prompt with context and explicit sentence-level citation rules
+    context_block = f"\n\nContext:\n{context}\n\n" if context else ""
     strict_query = (
-        f"{query}\n\n"
+        f"Question: {query}\n"
+        f"{context_block}"
         "IMPORTANT INSTRUCTIONS:\n"
-        "1. Do not output JSON or tool calls. Answer directly in plain text using the context.\n"
-        "2. Cite your sources using [1], [2], etc. after each factual claim.\n"
-        "3. FORMATTING: If the answer is short, keep it to 1-2 lines. If the answer requires detail, ALWAYS start with a 1-2 sentence summary (gist), followed by a blank line, and then the detailed explanation.\n"
-        "4. NEVER write a single massive paragraph. Break long answers into multiple short paragraphs or use bullet points for readability."
+        "1. Answer using ONLY the provided numbered context chunks above. Do not output JSON or tool calls. Answer directly in plain text.\n"
+        "2. Every factual claim MUST end with its inline source citation in brackets, e.g. 'Paris is the capital of France [1].'\n"
+        "3. If the context does not contain the answer, state that you cannot answer based on the retrieved context.\n"
+        "4. Keep the answer direct and concise (1-3 sentences). Do not add meta-commentary, conversational filler, or disclaimers."
     )
 
     messages = [
@@ -215,9 +217,26 @@ async def safe_generate(query: str, context: str = "") -> Optional[str]:
 
     try:
         response = await rails_app.generate_async(messages=messages)
+        content = None
         if isinstance(response, dict):
-            return response.get("content") or None
-        return str(response) if response else None
+            content = response.get("content")
+        elif response:
+            content = str(response)
+
+        if not content:
+            return None
+
+        # If Guardrails output a tool call JSON or error, fall back to direct LLM
+        trimmed = content.strip()
+        if (
+            (trimmed.startswith("{") and trimmed.endswith("}"))
+            or "Error:" in trimmed
+            or "not initialized" in trimmed
+        ):
+            logger.warning("Guardrails returned invalid or tool-call response. Falling back to direct LLM.")
+            return None
+
+        return content
     except Exception as exc:
         logger.warning("NeMo Guardrails generation failed: %s", exc)
         return None
