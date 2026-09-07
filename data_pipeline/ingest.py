@@ -28,15 +28,39 @@ if hasattr(sys.stdout, "reconfigure"):
 import queue
 import threading
 
-# Optional: inject cuDNN DLLs for ONNX Runtime GPU acceleration on Windows
-if os.name == "nt":
-    cudnn_path = os.environ.get("CUDNN_PATH", "")
-    if cudnn_path and os.path.exists(cudnn_path):
-        os.environ["PATH"] = cudnn_path + os.pathsep + os.environ.get("PATH", "")
-        os.add_dll_directory(cudnn_path)
-
 # Set up cache directories (portable: uses env var or project-relative default)
 _project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+from dotenv import load_dotenv
+
+# Load .env variables (HF_TOKEN, etc.)
+load_dotenv(os.path.join(_project_root, ".env"))
+
+# Pass HF_TOKEN to environment for huggingface_hub and datasets
+hf_token = os.environ.get("HF_TOKEN", "")
+if hf_token:
+    os.environ["HUGGING_FACE_HUB_TOKEN"] = hf_token
+
+# Automatically inject CUDA, cuDNN, and ONNX Runtime DLL directories on Windows
+if os.name == "nt":
+    _site_pkgs = os.path.join(_project_root, ".venv", "Lib", "site-packages")
+    _cuda_dirs = [
+        os.path.join(_site_pkgs, "nvidia", "cudnn", "bin"),
+        os.path.join(_site_pkgs, "nvidia", "cublas", "bin"),
+        os.path.join(_site_pkgs, "onnxruntime", "capi"),
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin",
+        os.environ.get("CUDA_PATH", ""),
+        os.environ.get("CUDNN_PATH", ""),
+    ]
+    for _d in _cuda_dirs:
+        _bin_d = os.path.join(_d, "bin") if os.path.isdir(os.path.join(_d, "bin")) else _d
+        if os.path.isdir(_bin_d):
+            os.environ["PATH"] = _bin_d + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(_bin_d)
+            except Exception:
+                pass
+
 cache_dir = os.environ.get("WIKIMIND_CACHE_DIR", os.path.join(_project_root, "data", "cache"))
 os.makedirs(cache_dir, exist_ok=True)
 os.environ.setdefault("HF_HOME", os.path.join(cache_dir, "huggingface"))
@@ -604,14 +628,58 @@ def run_ingestion(
         "off" if skip_ner else "on",
     )
 
-    # Load wikipedia dataset in streaming mode
-    logger.info("Loading Wikipedia dataset from HuggingFace (streaming mode)...")
-    dataset = load_dataset("wikimedia/wikipedia", "20231101.en", split="train", streaming=True)
+    # Load wikipedia dataset with smart shard skipping and HF_TOKEN
+    TOTAL_SHARDS = 41
+    ROWS_PER_SHARD = 156289
+    auth_token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
 
-    # Skip already processed
     if processed_count > 0:
-        logger.info("Skipping first %d articles (resuming from checkpoint)...", processed_count)
-        dataset = dataset.skip(processed_count)
+        start_shard = min(processed_count // ROWS_PER_SHARD, TOTAL_SHARDS - 1)
+        skip_in_shard = processed_count - (start_shard * ROWS_PER_SHARD)
+        if start_shard > 0:
+            logger.info(
+                "🚀 Smart resume: Skipping first %d shards (0 to %d). Starting from shard %d.",
+                start_shard,
+                start_shard - 1,
+                start_shard,
+            )
+            shard_urls = [
+                f"https://huggingface.co/datasets/wikimedia/wikipedia/resolve/main/20231101.en/train-{i:05d}-of-{TOTAL_SHARDS:05d}.parquet"
+                for i in range(start_shard, TOTAL_SHARDS)
+            ]
+            dataset = load_dataset(
+                "parquet",
+                data_files={"train": shard_urls},
+                split="train",
+                streaming=True,
+                token=auth_token,
+            )
+            if skip_in_shard > 0:
+                logger.info(
+                    "Fast-skipping remaining %d articles in shard %d (resuming from checkpoint)...",
+                    skip_in_shard,
+                    start_shard,
+                )
+                dataset = dataset.skip(skip_in_shard)
+        else:
+            logger.info("Skipping first %d articles (resuming from checkpoint)...", processed_count)
+            dataset = load_dataset(
+                "wikimedia/wikipedia",
+                "20231101.en",
+                split="train",
+                streaming=True,
+                token=auth_token,
+            )
+            dataset = dataset.skip(processed_count)
+    else:
+        logger.info("Loading Wikipedia dataset from HuggingFace (streaming mode)...")
+        dataset = load_dataset(
+            "wikimedia/wikipedia",
+            "20231101.en",
+            split="train",
+            streaming=True,
+            token=auth_token,
+        )
 
     # Wrap the dataset in a background prefetch thread to prevent network I/O from starving the GPU
     dataset = prefetch_generator(dataset, max_prefetch=2000)
